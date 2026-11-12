@@ -1,0 +1,216 @@
+using Model :: #import "model";
+
+test_libc :: #system_library "libc";
+TestFork :: () -> s32 #foreign test_libc "fork";
+TestPause :: () -> s32 #foreign test_libc "pause";
+TestExit :: (status: s32) -> void #foreign test_libc "_exit";
+TestKill :: (pid: s32, signal: s32) -> s32 #foreign test_libc "kill";
+TestWait :: (pid: s32, status: *s32, options: s32) -> s32 #foreign test_libc "waitpid";
+
+BytesOf :: (text: string, output: []u8) -> []u8 {
+    count: s32 = 0
+    for byte: text {
+        if count >= cast(s32)output.count { break }
+        output[count] = byte
+        count += 1
+    }
+    return output[0:count]
+}
+
+// Native model tests: no display and no window, only /proc reads, sorting,
+// formatting, and the signal binding. Returns nonzero on the first failure.
+ParserTest :: () -> bool {
+    cpu := "cpu  100 20 30 400 5 6 7 8 90 10\n"
+    cpu_bytes: [64]u8
+    busy, total, ok := Model.CpuTotals(BytesOf(cpu, cpu_bytes[:]))
+    if !ok || busy != 171 || total != 576 {
+        print("parse: cpu guest accounting wrong\n")
+        return false
+    }
+
+    stat := "4321 (worker (stage) name) S 1 2 3 4 -1 6 7 8 9 10 11 12 13 14 15 -5 17 18 19 20 21\n"
+    stat_bytes: [192]u8
+    process: Model.Process
+    if !Model.ParseStat(BytesOf(stat, stat_bytes[:]), *process) {
+        print("parse: process stat rejected\n")
+        return false
+    }
+    if TextView(process.name[0:process.name_count]) != "worker (stage) name" ||
+       process.state != Model.STATE_SLEEPING || process.ticks != 23 ||
+       process.memory_bytes == 0 {
+        print("parse: process stat fields wrong\n")
+        return false
+    }
+    return true
+}
+
+ScanTest :: () -> bool {
+    Model.Refresh()
+    Model.Refresh()
+    snapshot := Model.Current()
+    if snapshot.count <= 0 {
+        print("scan: no processes found\n")
+        return false
+    }
+    if snapshot.memory_total <= 0 {
+        print("scan: memory total missing\n")
+        return false
+    }
+    if snapshot.cpu_percent < 0.0 || snapshot.cpu_percent > 100.0 {
+        print("scan: total cpu percent out of range\n")
+        return false
+    }
+    mine := Model.CurrentProcessId()
+    index := Model.FindProcess(snapshot, mine)
+    if index < 0 {
+        print("scan: own process missing\n")
+        return false
+    }
+    entry := snapshot.processes[index]
+    if entry.name_count <= 0 {
+        print("scan: own process name empty\n")
+        return false
+    }
+    if entry.memory_bytes == 0 {
+        print("scan: own process memory zero\n")
+        return false
+    }
+    if entry.state == 0 {
+        print("scan: own process state missing\n")
+        return false
+    }
+    return true
+}
+
+SortTest :: () -> bool {
+    data: Model.Snapshot
+    data.count = 3
+    data.processes[0].pid = 30
+    data.processes[0].cpu_percent = 1.5
+    data.processes[0].memory_bytes = 300
+    data.processes[0].name_count = 1
+    data.processes[0].name[0] = 99
+    data.processes[1].pid = 10
+    data.processes[1].cpu_percent = 3.5
+    data.processes[1].memory_bytes = 100
+    data.processes[1].name_count = 1
+    data.processes[1].name[0] = 97
+    data.processes[2].pid = 20
+    data.processes[2].cpu_percent = 2.5
+    data.processes[2].memory_bytes = 200
+    data.processes[2].name_count = 1
+    data.processes[2].name[0] = 98
+    order: [Model.MAX_PROCESSES]s32
+    Model.SortOrder(*data, order[:], 1, 1)
+    if order[0] != 1 || order[1] != 2 || order[2] != 0 {
+        print("sort: pid ascending wrong\n")
+        return false
+    }
+    Model.SortOrder(*data, order[:], 1, -1)
+    if order[0] != 0 || order[1] != 2 || order[2] != 1 {
+        print("sort: pid descending wrong\n")
+        return false
+    }
+    Model.SortOrder(*data, order[:], 2, -1)
+    if order[0] != 1 || order[1] != 2 || order[2] != 0 {
+        print("sort: cpu descending wrong\n")
+        return false
+    }
+    Model.SortOrder(*data, order[:], 3, -1)
+    if order[0] != 0 || order[1] != 2 || order[2] != 1 {
+        print("sort: memory descending wrong\n")
+        return false
+    }
+    Model.SortOrder(*data, order[:], 0, 1)
+    if order[0] != 1 || order[1] != 2 || order[2] != 0 {
+        print("sort: name ascending wrong\n")
+        return false
+    }
+    data.processes[0].state = Model.STATE_RUNNING
+    data.processes[1].state = Model.STATE_SLEEPING
+    data.processes[2].state = Model.STATE_WAITING
+    Model.SortOrder(*data, order[:], 4, 1)
+    if order[0] != 2 || order[1] != 0 || order[2] != 1 {
+        print("sort: state ascending wrong\n")
+        return false
+    }
+    Model.SortOrder(*data, order[:], 4, 0)
+    if order[0] != 0 || order[1] != 1 || order[2] != 2 {
+        print("sort: natural order wrong\n")
+        return false
+    }
+    return true
+}
+
+FormatTest :: () -> bool {
+    buffer: [32]u8
+    if Model.FormatBytes(1536, buffer[:]) != "1.5 KB" {
+        print("format: 1536 bytes wrong\n")
+        return false
+    }
+    if Model.FormatBytes(0, buffer[:]) != "0 B" {
+        print("format: zero bytes wrong\n")
+        return false
+    }
+    if Model.FormatBytes(cast(u64)3 * 1024 * 1024 * 1024, buffer[:]) != "3 GB" {
+        print("format: 3 GiB wrong\n")
+        return false
+    }
+    if Model.StateName(Model.STATE_RUNNING) != "Running" {
+        print("format: running state wrong\n")
+        return false
+    }
+    return true
+}
+
+SignalTest :: () -> bool {
+    if Model.EndTask(0) {
+        print("signal: nonpositive pid accepted\n")
+        return false
+    }
+    if Model.EndTask(2147483647) {
+        print("signal: nonexistent pid reported as stopped\n")
+        return false
+    }
+    child := TestFork()
+    if child < 0 {
+        print("signal: could not create test child\n")
+        return false
+    }
+    if child == 0 {
+        unused TestPause()
+        TestExit(70)
+        return false
+    }
+    if !Model.EndTask(child) {
+        unused TestKill(child, 9)
+        cleanup_status: s32
+        unused TestWait(child, *cleanup_status, 0)
+        print("signal: SIGTERM request failed\n")
+        return false
+    }
+    status: s32
+    if TestWait(child, *status, 0) != child {
+        print("signal: test child was not reaped\n")
+        return false
+    }
+    if (status & 127) != Model.STOP_SIGNAL {
+        print("signal: test child did not receive SIGTERM\n")
+        return false
+    }
+    return true
+}
+
+main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 1 {
+        print("usage: model_test\n")
+        return 64
+    }
+    if !ParserTest() { print("parser fixture test failed\n"); return 65 }
+    if !ScanTest() { print("scan/snapshot test failed\n"); return 66 }
+    if !SortTest() { print("sort test failed\n"); return 67 }
+    if !FormatTest() { print("format test failed\n"); return 68 }
+    if !SignalTest() { print("signal binding test failed\n"); return 69 }
+    print("taskmgr model tests passed\n")
+    return 0
+}

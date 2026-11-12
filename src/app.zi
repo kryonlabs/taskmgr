@@ -1,0 +1,306 @@
+using UI :: #import "Widgets";
+using Model :: #import "model";
+Tables :: #import "data_views/TableView";
+Number :: #import "std/number_text";
+Timer :: #import "std/timer_linux";
+#import "layout"
+
+// taskmgr: a Kryon process monitor for Linux. Frame runs every frame and
+// declares the whole interface from the model's current /proc snapshot; the
+// table sorts by clicking its headers and the model refreshes once a second.
+//
+//   kryon run          the desktop window
+//   kryon run shot     one rendered frame without a display
+
+COLUMNS :: 5;
+REFRESH_INTERVAL_MS :: 1000;
+REFRESH_FALLBACK_FRAMES :: 60;
+CELL_WIDTH :: 24;
+NAME_WIDTH :: 64;
+STATUS_WIDTH :: 128;
+
+table_columns: [5]string = .{"Name", "PID", "CPU %", "Memory", "State"};
+column_fractions: [5]float32 = .{0.40, 0.10, 0.12, 0.22, 0.16};
+column_widths: [COLUMNS]s32;
+widths_ready: bool;
+
+order: [Model.MAX_PROCESSES]s32;
+
+// Table cell text in two generations, swapped each rebuild, so the previous
+// frame's row views never alias the storage being rewritten. The generations
+// are separate globals so the borrow checker sees disjoint backing storage.
+CellText :: struct {
+    cell: [Model.MAX_PROCESSES * COLUMNS]string
+    name: [Model.MAX_PROCESSES * NAME_WIDTH]u8
+    pid: [Model.MAX_PROCESSES * CELL_WIDTH]u8
+    cpu: [Model.MAX_PROCESSES * CELL_WIDTH]u8
+    mem: [Model.MAX_PROCESSES * CELL_WIDTH]u8
+}
+
+text_stores_a: CellText;
+text_stores_b: CellText;
+text_active: s32;
+
+sort_column: s32 = 2;
+sort_direction: s32 = -1;
+selected_row: s32 = -1;
+selected_pid: s32 = -1;
+selected_column: s32 = -1;
+scroll_offset: s32 = 0;
+frames_since_refresh: s32;
+last_refresh_ms: s64 = -1;
+pending_sort: bool;
+refresh_requested: bool;
+
+// The status message is stored as raw bytes; no global retains a string view
+// into it, so it can be rewritten between frames. The interface builds its
+// display strings into frame locals every frame.
+status_bytes: [STATUS_WIDTH]u8;
+status_length: s32;
+
+TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
+    accent: bool, disabled: bool) -> bool {
+    props: ButtonProps
+    props.key = cast(u64)id
+    props.id = id
+    props.bounds = bounds
+    props.label = label
+    props.disabled = disabled
+    if accent {
+        props.tone = ButtonTone.ButtonToneAccent
+        props.emphasis = ButtonEmphasis.ButtonEmphasisFilled
+    }
+    return Button(session, props) == 1
+}
+
+// Rebuilds the display order and one text generation from the current
+// snapshot. Callers write only the generation without live row views.
+RebuildOrder :: (store: *CellText) {
+    snapshot := Model.Current()
+    selected_row = -1
+    Model.SortOrder(snapshot, order[:], sort_column, sort_direction)
+    if snapshot.count > 0 {
+        for index: 0..snapshot.count - 1 {
+            slot := order[index]
+            entry := snapshot.processes[slot]
+            if entry.pid == selected_pid { selected_row = index }
+            base := index * COLUMNS
+            name_base := index * NAME_WIDTH
+            name_length := entry.name_count
+            if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
+            if name_length > 0 {
+                for name_index: 0..name_length - 1 {
+                    store.name[name_base + name_index] = entry.name[name_index]
+                }
+            }
+            store.cell[base + 0] = TextView(store.name[name_base:name_base + name_length])
+            store.cell[base + 1] = Number.FormatInteger(cast(s64)entry.pid,
+                store.pid[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
+            store.cell[base + 2] = Number.FormatDecimal(entry.cpu_percent,
+                1, store.cpu[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
+            store.cell[base + 3] = Model.FormatBytes(entry.memory_bytes,
+                store.mem[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
+            store.cell[base + 4] = Model.StateName(entry.state)
+        }
+    }
+}
+
+BuildOrder :: () {
+    if text_active == 0 {
+        RebuildOrder(*text_stores_b)
+        text_active = 1
+    } else {
+        RebuildOrder(*text_stores_a)
+        text_active = 0
+    }
+}
+
+// Copies the message parts into the raw status bytes for later frames.
+SetStatus :: (parts: []string) {
+    length: s32 = 0
+    for part: parts {
+        for byte: part {
+            if length >= STATUS_WIDTH { break }
+            status_bytes[length] = byte
+            length += 1
+        }
+    }
+    status_length = length
+}
+
+#program_export
+Frame :: (session: Session, viewport: Rectangle) -> s32 {
+    frames_since_refresh += 1
+    now_ms := Timer.MonotonicMilliseconds()
+    refreshed := last_refresh_ms < 0
+    if now_ms >= 0 && last_refresh_ms >= 0 &&
+       (now_ms < last_refresh_ms || now_ms - last_refresh_ms >= REFRESH_INTERVAL_MS) {
+        refreshed = true
+    }
+    if now_ms < 0 && frames_since_refresh >= REFRESH_FALLBACK_FRAMES { refreshed = true }
+    if refresh_requested { refreshed = true }
+    if refreshed {
+        Model.Refresh()
+        frames_since_refresh = 0
+        if now_ms >= 0 { last_refresh_ms = now_ms } else { last_refresh_ms = 0 }
+        refresh_requested = false
+    }
+    if refreshed || pending_sort {
+        BuildOrder()
+        pending_sort = false
+    }
+    snapshot := Model.Current()
+
+    page := PageFor(viewport, 640.0)
+    left := viewport.x + 16.0
+    content_width := viewport.width - 32.0
+    y := viewport.y + 12.0
+
+    Label(session, 2, "Task Manager", .{left, y, content_width, 34.0}, FontSize(*page, 26))
+    y += 42.0
+
+    cpu_percent_line: [32]u8
+    cpu_line: [96]u8
+    cpu_parts: [3]string = .{"CPU  ",
+        Number.FormatDecimal(snapshot.cpu_percent, 1, cpu_percent_line[:]), "%"}
+    Label(session, 3, JoinAll(cpu_parts[:], cpu_line[:]), .{left, y, content_width, 18.0},
+        FontSize(*page, 15))
+    y += 22.0
+
+    memory_percent: s32 = 0
+    if snapshot.memory_total > 0 {
+        memory_percent = cast(s32)(100.0 * cast(float64)snapshot.memory_used
+            / cast(float64)snapshot.memory_total + 0.5)
+    }
+    mem_used_line: [32]u8
+    mem_total_line: [32]u8
+    mem_line: [128]u8
+    mem_parts: [4]string = .{"Memory  ", Model.FormatBytes(snapshot.memory_used, mem_used_line[:]),
+        " / ", Model.FormatBytes(snapshot.memory_total, mem_total_line[:])}
+    Label(session, 4, JoinAll(mem_parts[:], mem_line[:]), .{left, y, content_width, 18.0},
+        FontSize(*page, 15))
+    y += 22.0
+
+    cpu_value := cast(s32)snapshot.cpu_percent
+    if cpu_value < 0 { cpu_value = 0 }
+    if cpu_value > 100 { cpu_value = 100 }
+    if !page.cells {
+        cpu_progress: ProgressProps
+        cpu_progress.key = 30
+        cpu_progress.bounds = .{left, y, content_width, 14.0}
+        cpu_progress.min = 0
+        cpu_progress.max = 100
+        cpu_progress.value = cpu_value
+        cpu_progress.label = "Total CPU"
+        Progress(session, cpu_progress)
+        y += 20.0
+        memory_progress: ProgressProps
+        memory_progress.key = 31
+        memory_progress.bounds = .{left, y, content_width, 14.0}
+        memory_progress.min = 0
+        memory_progress.max = 100
+        memory_progress.value = memory_percent
+        memory_progress.label = "Memory used"
+        Progress(session, memory_progress)
+        y += 22.0
+    }
+
+    if !widths_ready {
+        for column: 0..COLUMNS - 1 {
+            width := cast(s32)(cast(float32)(viewport.width - 24.0) * column_fractions[column])
+            if width < 48 { width = 48 }
+            column_widths[column] = width
+        }
+        widths_ready = true
+    }
+
+    table_height := viewport.y + viewport.height - y - 78.0
+    if table_height < 60.0 { table_height = 60.0 }
+    table_rows: [Model.MAX_PROCESSES]Tables.TableRow
+    if text_active == 0 {
+        if snapshot.count > 0 {
+            for index: 0..snapshot.count - 1 {
+                table_rows[index].cells = text_stores_a.cell[index * COLUMNS:(index + 1) * COLUMNS]
+            }
+        }
+    } else {
+        if snapshot.count > 0 {
+            for index: 0..snapshot.count - 1 {
+                table_rows[index].cells = text_stores_b.cell[index * COLUMNS:(index + 1) * COLUMNS]
+            }
+        }
+    }
+    table := Tables.TableView(session, Tables.TableViewProps.{.key = 100,
+        .bounds = .{viewport.x + 8.0, y, viewport.width - 16.0, table_height},
+        .columns = table_columns[:], .rows = table_rows[0:snapshot.count],
+        .column_widths = column_widths[:], .selected_row = selected_row,
+        .selected_column = selected_column, .sort_column = sort_column,
+        .sort_direction = sort_direction, .scroll_offset = scroll_offset,
+        .row_height = 26, .header_height = 30, .resizable = true})
+    selected_row = table.selected_row
+    selected_column = table.selected_column
+    scroll_offset = table.scroll_offset
+    selected_pid = -1
+    if selected_row >= 0 && selected_row < snapshot.count {
+        selected_pid = snapshot.processes[order[selected_row]].pid
+    }
+    if table.sort_column != sort_column || table.sort_direction != sort_direction {
+        sort_column = table.sort_column
+        sort_direction = table.sort_direction
+        pending_sort = true
+    }
+
+    status_line: [STATUS_WIDTH]u8
+    status_text: string = "Select a process, then End Task to stop it."
+    if status_length > 0 {
+        copy_length := status_length
+        if copy_length > STATUS_WIDTH { copy_length = STATUS_WIDTH }
+        for copy_index: 0..copy_length - 1 {
+            status_line[copy_index] = status_bytes[copy_index]
+        }
+        status_text = TextView(status_line[0:copy_length])
+    }
+    Label(session, 121, status_text, .{left, viewport.y + viewport.height - 66.0,
+        content_width, 14.0}, FontSize(*page, 13))
+
+    button_y := viewport.y + viewport.height - 46.0
+    half := (viewport.width - 40.0) / 2.0
+    if TaskButton(session, 110, "Refresh now", .{left, button_y, half, 32.0}, false, false) {
+        refresh_requested = true
+    }
+    if TaskButton(session, 111, "End Task", .{left + 24.0 + half, button_y, half, 32.0},
+            true, selected_row < 0) && selected_row >= 0 {
+        slot := order[selected_row]
+        target := snapshot.processes[slot]
+        if Model.EndTask(target.pid) {
+            refresh_requested = true
+            pid_line: [16]u8
+            pid_text := Number.FormatInteger(cast(s64)target.pid, pid_line[:])
+            status_name_length := target.name_count
+            if status_name_length > NAME_WIDTH { status_name_length = NAME_WIDTH }
+            status_name_line: [NAME_WIDTH]u8
+            if status_name_length > 0 {
+                for name_index: 0..status_name_length - 1 {
+                    status_name_line[name_index] = target.name[name_index]
+                }
+            }
+            stop_parts: [5]string = .{"Sent stop signal to ",
+                TextView(status_name_line[0:status_name_length]),
+                " (pid ", pid_text, ")"}
+            SetStatus(stop_parts[:])
+        } else {
+            failed_parts: [1]string = .{"Could not stop the selected process."}
+            SetStatus(failed_parts[:])
+        }
+    }
+
+    count_line: [16]u8
+    footer_line: [96]u8
+    count_text := Number.FormatInteger(cast(s64)snapshot.count, count_line[:])
+    footer_parts: [2]string = .{count_text, " processes"}
+    Label(session, 120, JoinAll(footer_parts[:], footer_line[:]),
+        .{left, viewport.y + viewport.height - 14.0, content_width, 12.0},
+        FontSize(*page, 12))
+
+    return 0
+}

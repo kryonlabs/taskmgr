@@ -1,0 +1,437 @@
+// Process metrics read from /proc on Linux, plus the ordering and formatting
+// helpers the taskmgr interface uses. Refresh keeps two snapshots and swaps
+// between them each call, so CPU percentages come from the previous sample
+// without copying snapshot storage.
+using Files :: #import "std/file";
+Number :: #import "std/number_text";
+
+libc :: #system_library "libc";
+SysConf :: (name: s32) -> s64 #foreign libc "sysconf";
+SendSignal :: (pid: s32, signal: s32) -> s32 #foreign libc "kill";
+ProcessId :: () -> s32 #foreign libc "getpid";
+
+CLOCK_TICKS_NAME :: 2; // _SC_CLK_TCK
+PAGE_SIZE_NAME :: 30; // _SC_PAGESIZE
+STOP_SIGNAL :: 15; // SIGTERM
+
+MAX_PROCESSES :: 1024;
+NAME_CAPACITY :: 64;
+COLUMNS :: 5;
+
+STATE_RUNNING :: 82; // R
+STATE_SLEEPING :: 83; // S
+STATE_WAITING :: 68; // D
+STATE_STOPPED :: 84; // T
+STATE_ZOMBIE :: 90; // Z
+STATE_IDLE :: 73; // I
+
+Process :: struct {
+    pid: s32
+    name_count: s32
+    name: [NAME_CAPACITY]u8
+    state: u8
+    cpu_percent: float64
+    memory_bytes: u64
+    ticks: u64
+}
+
+Snapshot :: struct {
+    processes: [MAX_PROCESSES]Process
+    count: s32
+    cpu_percent: float64
+    memory_used: u64
+    memory_total: u64
+    busy_ticks: u64
+    total_ticks: u64
+}
+
+state_names: [7]string = .{"Running", "Sleeping", "Waiting", "Stopped", "Zombie", "Idle", "Other"};
+
+snapshots: [2]Snapshot;
+active: s32;
+clock_ticks: float64;
+page_bytes: u64;
+timing_ready: bool;
+
+#program_export
+Current :: () -> *Snapshot {
+    return *snapshots[active]
+}
+
+#program_export
+CurrentProcessId :: () -> s32 {
+    return ProcessId()
+}
+
+EnsureTiming :: () {
+    if timing_ready { return }
+    ticks := SysConf(CLOCK_TICKS_NAME)
+    pages := SysConf(PAGE_SIZE_NAME)
+    if ticks > 0 { clock_ticks = cast(float64)ticks } else { clock_ticks = 100.0 }
+    if pages > 0 { page_bytes = cast(u64)pages } else { page_bytes = 4096 }
+    timing_ready = true
+}
+
+#program_export
+StateName :: (state: u8) -> string {
+    if state == STATE_RUNNING { return state_names[0] }
+    if state == STATE_SLEEPING { return state_names[1] }
+    if state == STATE_WAITING { return state_names[2] }
+    if state == STATE_STOPPED { return state_names[3] }
+    if state == STATE_ZOMBIE { return state_names[4] }
+    if state == STATE_IDLE { return state_names[5] }
+    return state_names[6]
+}
+
+// Reads a small file, such as a /proc entry, fully into a caller-owned buffer.
+// Returns the byte count, or -1 when the path cannot be opened.
+ReadSmall :: (path: string, buffer: []u8) -> s32 {
+    file := Files.OpenRead(path)
+    if !file.valid { return -1 }
+    total: s32 = 0
+    while total < cast(s32)buffer.count {
+        count := Files.ReadAt(file, buffer[total:buffer.count], cast(s64)total)
+        if count <= 0 { break }
+        total += cast(s32)count
+    }
+    Files.CloseFile(file)
+    return total
+}
+
+StatPath :: (pid: s32, output: []u8) -> string {
+    digits: [16]u8
+    pieces: [3]string = .{"/proc/", Number.FormatInteger(cast(s64)pid, digits[:]), "/stat"}
+    length: s32 = 0
+    for piece: pieces {
+        for byte: piece {
+            if length >= cast(s32)output.count { break }
+            output[length] = byte
+            length += 1
+        }
+    }
+    return TextView(output[0:length])
+}
+
+ParsePidName :: (name_bytes: []u8) -> s32 {
+    if name_bytes.count == 0 { return -1 }
+    value: s64 = 0
+    for byte: name_bytes {
+        if byte < 48 || byte > 57 { return -1 }
+        value = value * 10 + cast(s64)(byte - 48)
+        if value > 2147483647 { return -1 }
+    }
+    return cast(s32)value
+}
+
+// Parses /proc/<pid>/stat: the command name sits between the first '(' and the
+// last ')'; after it come the state and the numbered fields, where utime is
+// field 14, stime is field 15, and rss is field 24.
+#program_export
+ParseStat :: (content: []u8, process: *Process) -> bool {
+    EnsureTiming()
+    open: s32 = -1
+    close: s32 = -1
+    total := cast(s32)content.count
+    for index: 0..total - 1 {
+        if content[index] == 40 && open < 0 { open = index }
+        if content[index] == 41 { close = index }
+    }
+    if open < 0 || close <= open { return false }
+    name_length := close - open - 1
+    if name_length > NAME_CAPACITY { name_length = NAME_CAPACITY }
+    for index: 0..name_length - 1 {
+        process.name[index] = content[open + 1 + index]
+    }
+    process.name_count = name_length
+    cursor := close + 1
+    while cursor < total && content[cursor] == 32 { cursor += 1 }
+    if cursor >= total { return false }
+    process.state = content[cursor]
+    cursor += 1
+    utime: u64 = 0
+    stime: u64 = 0
+    rss: u64 = 0
+    field: s32 = 4
+    while field <= 24 && cursor < total {
+        while cursor < total && content[cursor] == 32 { cursor += 1 }
+        negative := false
+        if cursor < total && content[cursor] == 45 {
+            negative = true
+            cursor += 1
+        }
+        value: u64 = 0
+        digits: s32 = 0
+        while cursor < total && content[cursor] >= 48 && content[cursor] <= 57 {
+            value = value * 10 + cast(u64)(content[cursor] - 48)
+            cursor += 1
+            digits += 1
+        }
+        if digits == 0 { return false }
+        if !negative && field == 14 { utime = value }
+        if !negative && field == 15 { stime = value }
+        if !negative && field == 24 { rss = value }
+        field += 1
+    }
+    if field <= 24 { return false }
+    process.ticks = utime + stime
+    process.memory_bytes = rss * page_bytes
+    return true
+}
+
+// Sums /proc/stat's CPU values; busy excludes idle and iowait. Linux's guest
+// columns duplicate time already included in user and nice, so totals include
+// only the first eight columns.
+#program_export
+CpuTotals :: (content: []u8) -> (busy: u64, total: u64, ok: bool) {
+    cursor: s32 = 0
+    total_count := cast(s32)content.count
+    while cursor < total_count && content[cursor] != 32 { cursor += 1 }
+    values: [10]u64
+    count: s32 = 0
+    while count < 10 && cursor < total_count {
+        while cursor < total_count && content[cursor] == 32 { cursor += 1 }
+        if cursor >= total_count || content[cursor] == 10 { break }
+        value: u64 = 0
+        while cursor < total_count && content[cursor] >= 48 && content[cursor] <= 57 {
+            value = value * 10 + cast(u64)(content[cursor] - 48)
+            cursor += 1
+        }
+        values[count] = value
+        count += 1
+    }
+    if count < 4 { return 0, 0, false }
+    total_value: u64 = 0
+    idle_value: u64 = 0
+    included := count
+    if included > 8 { included = 8 }
+    for index: 0..included - 1 {
+        total_value += values[index]
+        if index == 3 || index == 4 { idle_value += values[index] }
+    }
+    return total_value - idle_value, total_value, true
+}
+
+// Reads the kilobyte value of a /proc/meminfo entry, such as "MemTotal:".
+LineKb :: (content: []u8, label: string) -> s64 {
+    limit := cast(s32)content.count
+    label_count := cast(s32)label.count
+    index: s32 = 0
+    while index < limit {
+        matched := true
+        offset: s32 = 0
+        while offset < label_count {
+            if index + offset >= limit || content[index + offset] != label[offset] {
+                matched = false
+                break
+            }
+            offset += 1
+        }
+        if matched {
+            cursor := index + offset
+            while cursor < limit && content[cursor] == 32 { cursor += 1 }
+            value: s64 = 0
+            while cursor < limit && content[cursor] >= 48 && content[cursor] <= 57 {
+                value = value * 10 + cast(s64)(content[cursor] - 48)
+                cursor += 1
+            }
+            return value
+        }
+        index += 1
+    }
+    return -1
+}
+
+FindTicks :: (snapshot: *Snapshot, pid: s32) -> (found: bool, ticks: u64) {
+    if snapshot.count > 0 {
+        for index: 0..snapshot.count - 1 {
+            if snapshot.processes[index].pid == pid {
+                return true, snapshot.processes[index].ticks
+            }
+        }
+    }
+    return false, 0
+}
+
+#program_export
+FindProcess :: (snapshot: *Snapshot, pid: s32) -> s32 {
+    if snapshot.count > 0 {
+        for index: 0..snapshot.count - 1 {
+            if snapshot.processes[index].pid == pid { return index }
+        }
+    }
+    return -1
+}
+
+// Samples /proc once into the next snapshot slot and swaps it in. CPU
+// percentages use the delta against the retained previous snapshot.
+#program_export
+Refresh :: () {
+    EnsureTiming()
+    target := *snapshots[1 - active]
+    previous := *snapshots[active]
+    target.count = 0
+    target.cpu_percent = 0
+    target.memory_used = 0
+    target.memory_total = 0
+    target.busy_ticks = 0
+    target.total_ticks = 0
+
+    stat_buffer: [8192]u8
+    busy: u64 = 0
+    total_ticks: u64 = 0
+    stat_length := ReadSmall("/proc/stat", stat_buffer[:])
+    if stat_length > 0 {
+        sample_busy, sample_total, ok := CpuTotals(stat_buffer[0:stat_length])
+        if ok {
+            busy = sample_busy
+            total_ticks = sample_total
+        }
+    }
+    mem_length := ReadSmall("/proc/meminfo", stat_buffer[:])
+    if mem_length > 0 {
+        total_kb := LineKb(stat_buffer[0:mem_length], "MemTotal:")
+        available_kb := LineKb(stat_buffer[0:mem_length], "MemAvailable:")
+        if available_kb < 0 { available_kb = LineKb(stat_buffer[0:mem_length], "MemFree:") }
+        if total_kb > 0 {
+            target.memory_total = cast(u64)total_kb * 1024
+            if available_kb >= 0 && available_kb <= total_kb {
+                target.memory_used = (cast(u64)total_kb - cast(u64)available_kb) * 1024
+            } else {
+                target.memory_used = target.memory_total
+            }
+        }
+    }
+
+    directory := Files.OpenDirectory("/proc")
+    path_buffer: [64]u8
+    while true {
+        entry := Files.NextDirectoryEntry(*directory)
+        if !entry.valid { break }
+        if target.count >= MAX_PROCESSES { break }
+        pid := ParsePidName(entry.name[0:entry.name_count])
+        if pid <= 0 { continue }
+        stat_entry := StatPath(pid, path_buffer[:])
+        length := ReadSmall(stat_entry, stat_buffer[:])
+        if length <= 0 { continue }
+        process: Process
+        process.pid = pid
+        if !ParseStat(stat_buffer[0:length], *process) { continue }
+        process.cpu_percent = 0
+        found, previous_ticks := FindTicks(previous, pid)
+        if found && process.ticks >= previous_ticks && total_ticks > previous.total_ticks {
+            delta := cast(float64)(process.ticks - previous_ticks)
+            span := cast(float64)(total_ticks - previous.total_ticks)
+            process.cpu_percent = 100.0 * delta / span
+        }
+        target.processes[target.count] = process
+        target.count += 1
+    }
+    Files.CloseDirectory(*directory)
+
+    target.busy_ticks = busy
+    target.total_ticks = total_ticks
+    if previous.total_ticks > 0 && total_ticks > previous.total_ticks && busy >= previous.busy_ticks {
+        delta_busy := cast(float64)(busy - previous.busy_ticks)
+        span := cast(float64)(total_ticks - previous.total_ticks)
+        target.cpu_percent = 100.0 * delta_busy / span
+    }
+    active = 1 - active
+}
+
+CompareName :: (left: []u8, right: []u8) -> s32 {
+    index: s32 = 0
+    while index < cast(s32)left.count && index < cast(s32)right.count {
+        if left[index] < right[index] { return -1 }
+        if left[index] > right[index] { return 1 }
+        index += 1
+    }
+    if left.count < right.count { return -1 }
+    if left.count > right.count { return 1 }
+    return 0
+}
+
+CompareRows :: (snapshot: *Snapshot, left: s32, right: s32, column: s32) -> s32 {
+    if left == right { return 0 }
+    if left < 0 || right < 0 || left >= snapshot.count || right >= snapshot.count { return 0 }
+    if column == 0 {
+        return CompareName(snapshot.processes[left].name[0:snapshot.processes[left].name_count],
+            snapshot.processes[right].name[0:snapshot.processes[right].name_count])
+    }
+    if column == 1 {
+        if snapshot.processes[left].pid < snapshot.processes[right].pid { return -1 }
+        if snapshot.processes[left].pid > snapshot.processes[right].pid { return 1 }
+        return 0
+    }
+    if column == 2 {
+        if snapshot.processes[left].cpu_percent < snapshot.processes[right].cpu_percent { return -1 }
+        if snapshot.processes[left].cpu_percent > snapshot.processes[right].cpu_percent { return 1 }
+        return 0
+    }
+    if column == 3 {
+        if snapshot.processes[left].memory_bytes < snapshot.processes[right].memory_bytes { return -1 }
+        if snapshot.processes[left].memory_bytes > snapshot.processes[right].memory_bytes { return 1 }
+        return 0
+    }
+    if column == 4 {
+        if snapshot.processes[left].state < snapshot.processes[right].state { return -1 }
+        if snapshot.processes[left].state > snapshot.processes[right].state { return 1 }
+        return 0
+    }
+    return 0
+}
+
+// Fills ORDER with a stable sort of the snapshot rows for COLUMN. Direction 1
+// sorts ascending, -1 descending, and 0 leaves the natural /proc order.
+#program_export
+SortOrder :: (snapshot: *Snapshot, order: []s32, column: s32, direction: s32) {
+    count := snapshot.count
+    if count > cast(s32)order.count { count = cast(s32)order.count }
+    if count > 0 {
+        for index: 0..count - 1 { order[index] = index }
+    }
+    if column < 0 || column >= COLUMNS || direction == 0 || count < 2 { return }
+    for slot: 1..count - 1 {
+        key := order[slot]
+        position := slot - 1
+        while position >= 0 {
+            comparison := CompareRows(snapshot, order[position], key, column)
+            if direction < 0 { comparison = -comparison }
+            if comparison <= 0 { break }
+            order[position + 1] = order[position]
+            position -= 1
+        }
+        order[position + 1] = key
+    }
+}
+
+#program_export
+FormatBytes :: (value: u64, output: []u8) -> string {
+    units: [5]string = .{" B", " KB", " MB", " GB", " TB"}
+    scaled := cast(float64)value
+    index: s32 = 0
+    while scaled >= 1024.0 && index < 4 {
+        scaled /= 1024.0
+        index += 1
+    }
+    places: s32 = 1
+    if index == 0 { places = 0 }
+    number: [32]u8
+    number_text := Number.FormatDecimal(scaled, places, number[:])
+    length: s32 = 0
+    pieces: [2]string = .{number_text, units[index]}
+    for piece: pieces {
+        for byte: piece {
+            if length >= cast(s32)output.count { break }
+            output[length] = byte
+            length += 1
+        }
+    }
+    return TextView(output[0:length])
+}
+
+// Sends SIGTERM; false when the kernel reports the request could not be made.
+#program_export
+EndTask :: (pid: s32) -> bool {
+    if pid <= 0 { return false }
+    return SendSignal(pid, STOP_SIGNAL) == 0
+}

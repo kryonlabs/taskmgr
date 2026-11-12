@@ -1,0 +1,53 @@
+[package]
+name = "taskmgr"
+entry = "src/app.zi"
+module_roots = ["src", "tests"]
+bridge_modules = ["app"]
+tool = "kryon"
+
+[toolchain]
+git = "https://github.com/ziranlang/ziran.git"
+ref = "master"
+
+[dependencies.kryon]
+git = "https://github.com/kryonlabs/kryon.git"
+ref = "master"
+
+[dependencies.data_views]
+git = "https://github.com/kryonlabs/data-views.git"
+ref = "master"
+
+[exports]
+model = "src/model.zi"
+
+[install]
+bin = "taskmgr"
+
+# `kryon run` opens the default profile; `kryon run shot > screen.ppm` renders
+# one frame without a display.
+[tool.kryon]
+default_profile = "desktop"
+entry = "src/app.zi"
+
+[tool.kryon.profiles.desktop]
+backend = "desktop"
+
+[tool.kryon.profiles.portable]
+backend = "desktop"
+codegen = "zx"
+
+[tool.kryon.profiles.tui]
+backend = "terminal"
+
+[tool.kryon.profiles.web]
+backend = "canvas"
+
+[tool.kryon.profiles.shot]
+backend = "pixmap"
+
+[tool.kryon.install]
+profile = "desktop"
+name = "Task Manager"
+icon_name = "utilities-system-monitor"
+comment = "Kryon process monitor"
+categories = "Utility;System;"
