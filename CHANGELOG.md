@@ -2,22 +2,24 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-13
+
 ### Changed
 
-- Reduced the native desktop working set from roughly 148 MB to below 30 MiB
-  by updating Kryon to its software pixel-presenter path, bounding process and
-  cell storage, and using a compact resizable native surface.
-- Added a private-Xvfb RSS regression that measures the steady application
-  after multiple process refreshes and enforces the 30 MiB limit.
-- System-theme colors now cover the whole page, tabs, process panel and status
-  panes instead of leaving mixed hard-coded white surfaces.
+- Task Manager now uses far less memory: the desktop app stays below 30 MiB
+  instead of roughly 148 MB, even after many process refreshes.
+- System-theme colors now cover the whole window, including tabs, the process
+  list and the status bar, instead of leaving mixed white surfaces.
 - Performance graphs use classic Windows-style colors and show each detected
-  GPU with a stable card label, distinct usage/VRAM history and explicit `n/a`
-  for unsupported driver counters.
-- Fixed VRAM readings that could appear 100% used because the used and total
-  sysfs reads shared a buffer; zero usage now remains 0%.
-- Ctrl+1, Ctrl+2 and Ctrl+3 switch to Applications, Processes and Performance
-  in visible tab order.
+  GPU with its own card label, separate usage and VRAM history, and `n/a`
+  when the driver does not report a reading.
+- Ctrl+1, Ctrl+2 and Ctrl+3 switch to the Applications, Processes and
+  Performance tabs in the order they appear.
+
+### Fixed
+
+- VRAM no longer appears 100% used when nothing is allocated; zero usage now
+  shows as 0%.
 
 ## [0.1.1] - 2026-11-12
 
