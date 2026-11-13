@@ -7,21 +7,25 @@ memory, plus total CPU and memory usage.
 ## Interface
 
 The window keeps the compact structure of the Windows 2000 Task Manager while
-installing the current Linux desktop palette for its controls: menu bar,
-Applications / Processes / Performance tabs, bordered content and a three-pane
-status bar.
+installing the host application's palette when one is supplied, or the current
+Linux desktop palette for a standalone window. That palette covers the menu
+bar, Applications / Processes / Performance tabs, bordered content and the
+three-pane status bar.
 
 - **Applications** lists top-level EWMH windows and can switch to one, request
   that it close, or open a new command.
 - **Processes** is a sortable DataViews table with image name, PID, CPU, CPU
   time and resident memory. Rows are grouped by image name by default, with all
   Codex-family processes combined under `codex`; Options → Group Processes
-  toggles the grouping. Selecting any cell highlights the complete row.
-  `End Process` sends SIGTERM after an optional warning for ungrouped rows.
+  toggles the grouping. Clicking an aggregate row expands or collapses its real
+  process rows. Selecting any cell highlights the complete row. `End Process`
+  sends SIGTERM to one member; `End Group` sends it to every current member and
+  reports any partial failure.
 - **Performance** shows 60-sample CPU, memory, GPU and VRAM histories as clean
   green lines on black, plus process, thread, handle, physical-memory, commit
-  and kernel-memory totals. GPU counters come from standard Linux DRM sysfs and
-  display `n/a` when the driver does not expose them.
+  and kernel-memory totals. Memory values use explicit adaptive B, KB, MB, GB
+  or TB units. GPU counters come from standard Linux DRM sysfs and display
+  `n/a` when the driver does not expose them.
 - File, Options, View and Help menus provide Run, refresh speed, manual refresh,
   kernel-time display, process grouping, end-process confirmation and About
   actions.

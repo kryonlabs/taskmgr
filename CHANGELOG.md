@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1] - 2026-11-12
+
+### Changed
+
+- Process groups now expand and collapse from their aggregate row, exposing
+  every member as a normal selectable process row.
+- Added `End Group`, which sends SIGTERM to every current member and reports
+  partial failures instead of hiding them.
+- Memory readings now use explicit adaptive units such as MB and GB.
+- The desktop window now accepts Harmony's host palette when available and
+  falls back to the current Linux desktop palette for standalone launches.
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

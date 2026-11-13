@@ -1,4 +1,7 @@
 ZIRAN ?= ./scripts/ziran.sh
+# The host-aware desktop palette reads the supervising X11 container. Kryon's
+# native project linker consumes LDLIBS at the final link boundary.
+export LDLIBS += -lX11
 SOURCES := $(wildcard src/*.zi) $(wildcard tests/*.zi) ziran.toml ziran.lock scripts/ziran.sh Makefile
 
 .PHONY: all build run check test x11-test shot clean

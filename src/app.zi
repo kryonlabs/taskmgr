@@ -4,7 +4,7 @@ Apps :: #import "windows";
 Tables :: #import "data_views/TableView";
 Theme :: #import "kryon/Theme";
 SystemTheme :: #import "kryon/SystemTheme";
-SystemThemeLinux :: #import "kryon/SystemThemeLinux";
+SystemThemeHostLinux :: #import "kryon/SystemThemeHostLinux";
 Window :: #import "kryon/Window";
 Number :: #import "std/number_text";
 Timer :: #import "std/timer_linux";
@@ -22,7 +22,11 @@ Timer :: #import "std/timer_linux";
 // TASKMGR_TAB=applications|processes|performance picks the starting tab.
 
 libc :: #system_library "libc";
+// SystemThemeHostLinux reads the supervising X11 container palette. Keep its
+// native library on the final application link as well as inside the module.
+theme_x11 :: #system_library "X11";
 Environment :: (name: *u8) -> *u8 #foreign libc "getenv";
+ThemeXInitThreads :: () -> s32 #foreign theme_x11 "XInitThreads";
 
 TAB_APPLICATIONS :: 0;
 TAB_PROCESSES :: 1;
@@ -63,8 +67,9 @@ APP_COLUMNS :: 2;
 CELL_WIDTH :: 24;
 NAME_WIDTH :: 64;
 STATUS_WIDTH :: 160;
+MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES * 2;
 
-process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Mem Usage"};
+process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Memory"};
 process_fractions: [5]float32 = .{0.40, 0.12, 0.10, 0.16, 0.22};
 process_widths: [COLUMNS]s32;
 app_columns: [2]string = .{"Task", "Status"};
@@ -72,18 +77,36 @@ app_fractions: [2]float32 = .{0.76, 0.24};
 app_widths: [APP_COLUMNS]s32;
 widths_for: float32;
 
-order: [Model.MAX_PROCESSES]s32;
+group_order: [Model.MAX_PROCESSES]s32;
+raw_order: [Model.MAX_PROCESSES]s32;
+
+DisplayRow :: struct {
+    process_index: s32
+    group_index: s32
+    group_header: bool
+}
+
+display_rows: [MAX_DISPLAY_ROWS]DisplayRow;
+display_count: s32;
+
+ExpandedGroup :: struct {
+    name_count: s32
+    name: [Model.NAME_CAPACITY]u8
+}
+
+expanded_groups: [Model.MAX_PROCESSES]ExpandedGroup;
+expanded_count: s32;
 
 // Table cell text in two generations, swapped each rebuild, so the previous
 // frame's row views never alias the storage being rewritten. The generations
 // are separate globals so the borrow checker sees disjoint backing storage.
 CellText :: struct {
-    cell: [Model.MAX_PROCESSES * COLUMNS]string
-    name: [Model.MAX_PROCESSES * NAME_WIDTH]u8
-    pid: [Model.MAX_PROCESSES * CELL_WIDTH]u8
-    cpu: [Model.MAX_PROCESSES * CELL_WIDTH]u8
-    time: [Model.MAX_PROCESSES * CELL_WIDTH]u8
-    mem: [Model.MAX_PROCESSES * CELL_WIDTH]u8
+    cell: [MAX_DISPLAY_ROWS * COLUMNS]string
+    name: [MAX_DISPLAY_ROWS * NAME_WIDTH]u8
+    pid: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+    cpu: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+    time: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+    mem: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
 }
 
 text_stores_a: CellText;
@@ -108,6 +131,9 @@ sort_column: s32 = Model.COLUMN_CPU;
 sort_direction: s32 = -1;
 selected_row: s32 = -1;
 selected_pid: s32 = -1;
+selected_is_group: bool;
+selected_group_name: [Model.NAME_CAPACITY]u8;
+selected_group_name_count: s32;
 selected_column: s32 = -1;
 scroll_offset: s32 = 0;
 
@@ -127,6 +153,10 @@ group_processes: bool = true;
 
 dialog: s32 = DIALOG_NONE;
 end_pid: s32 = -1;
+end_is_group: bool;
+end_group_name: [Model.NAME_CAPACITY]u8;
+end_group_name_count: s32;
+end_group_members: s32;
 command_bytes: [Model.COMMAND_CAPACITY]u8;
 command_next: [Model.COMMAND_CAPACITY]u8;
 command_length: s32;
@@ -200,65 +230,167 @@ StartingTab :: () -> s32 {
     return TAB_PROCESSES
 }
 
-// Rebuilds the display order and one text generation from the current
-// snapshot. Callers write only the generation without live row views.
-ProcessSnapshot :: () -> *Model.Snapshot {
-    if group_processes { return Model.GroupedCurrent() }
-    return Model.Current()
+// Group names are retained as bytes, never as string views into refreshed
+// snapshots. The model's matcher keeps Codex-family aliases in one group.
+GroupNameMatches :: (name: []u8, entry: *Model.Process) -> bool {
+    probe: Model.Process
+    count := cast(s32)name.count
+    if count > Model.NAME_CAPACITY { count = Model.NAME_CAPACITY }
+    probe.name_count = count
+    if count > 0 {
+        for index: 0..count - 1 { probe.name[index] = name[index] }
+    }
+    return Model.SameProcessGroup(*probe, entry)
+}
+
+CopyGroupName :: (entry: *Model.Process, output: []u8) -> s32 {
+    count := entry.name_count
+    if count > cast(s32)output.count { count = cast(s32)output.count }
+    if count > 0 {
+        for index: 0..count - 1 { output[index] = entry.name[index] }
+    }
+    return count
+}
+
+GroupExpanded :: (entry: *Model.Process) -> bool {
+    if expanded_count > 0 {
+        for index: 0..expanded_count - 1 {
+            saved := *expanded_groups[index]
+            if GroupNameMatches(saved.name[0:saved.name_count], entry) { return true }
+        }
+    }
+    return false
+}
+
+ToggleGroup :: (entry: *Model.Process) {
+    if expanded_count > 0 {
+        for index: 0..expanded_count - 1 {
+            saved := *expanded_groups[index]
+            if GroupNameMatches(saved.name[0:saved.name_count], entry) {
+                expanded_count -= 1
+                if index != expanded_count { expanded_groups[index] = expanded_groups[expanded_count] }
+                return
+            }
+        }
+    }
+    if expanded_count >= Model.MAX_PROCESSES { return }
+    expanded_groups[expanded_count].name_count =
+        CopyGroupName(entry, expanded_groups[expanded_count].name[:])
+    expanded_count += 1
+}
+
+AppendDisplayRow :: (process_index: s32, group_index: s32, group_header: bool) {
+    if display_count >= MAX_DISPLAY_ROWS { return }
+    display_rows[display_count].process_index = process_index
+    display_rows[display_count].group_index = group_index
+    display_rows[display_count].group_header = group_header
+    display_count += 1
+}
+
+// Builds a flat table: aggregate group headers in the requested sort order,
+// followed by the group's real processes while that header is expanded.
+BuildDisplayRows :: () {
+    raw := Model.Current()
+    grouped := Model.GroupedCurrent()
+    display_count = 0
+    Model.SortOrder(raw, raw_order[:], sort_column, sort_direction)
+    if !group_processes {
+        if raw.count > 0 {
+            for index: 0..raw.count - 1 { AppendDisplayRow(raw_order[index], -1, false) }
+        }
+        return
+    }
+    Model.SortOrder(grouped, group_order[:], sort_column, sort_direction)
+    if grouped.count <= 0 { return }
+    for position: 0..grouped.count - 1 {
+        group_index := group_order[position]
+        group := *grouped.processes[group_index]
+        if group.group_count <= 1 {
+            process_index := Model.FindProcess(raw, group.pid)
+            if process_index >= 0 { AppendDisplayRow(process_index, -1, false) }
+            continue
+        }
+        AppendDisplayRow(-1, group_index, true)
+        if GroupExpanded(group) && raw.count > 0 {
+            for raw_position: 0..raw.count - 1 {
+                process_index := raw_order[raw_position]
+                entry := *raw.processes[process_index]
+                if Model.SameProcessGroup(group, entry) {
+                    AppendDisplayRow(process_index, group_index, false)
+                }
+            }
+        }
+    }
 }
 
 RebuildOrder :: (store: *CellText) {
-    snapshot := ProcessSnapshot()
+    raw := Model.Current()
+    grouped := Model.GroupedCurrent()
+    BuildDisplayRows()
     selected_row = -1
-    Model.SortOrder(snapshot, order[:], sort_column, sort_direction)
-    if snapshot.count > 0 {
-        for index: 0..snapshot.count - 1 {
-            slot := order[index]
-            entry := snapshot.processes[slot]
-            if entry.pid == selected_pid { selected_row = index }
-            base := index * COLUMNS
-            name_base := index * NAME_WIDTH
-            name_length := entry.name_count
-            if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
-            if name_length > 0 {
-                for name_index: 0..name_length - 1 {
-                    store.name[name_base + name_index] = entry.name[name_index]
-                }
+    if display_count <= 0 { return }
+    for index: 0..display_count - 1 {
+        row := display_rows[index]
+        entry: Model.Process
+        if row.group_header {
+            entry = grouped.processes[row.group_index]
+            if selected_is_group &&
+               GroupNameMatches(selected_group_name[0:selected_group_name_count], *entry) {
+                selected_row = index
             }
-            if entry.group_count > 1 && name_length < NAME_WIDTH {
-                store.name[name_base + name_length] = 32
-                name_length += 1
-                if name_length < NAME_WIDTH {
-                    store.name[name_base + name_length] = 40
-                    name_length += 1
-                }
-                group_digits: [16]u8
-                group_text := Number.FormatInteger(cast(s64)entry.group_count, group_digits[:])
-                for byte: group_text {
-                    if name_length >= NAME_WIDTH { break }
-                    store.name[name_base + name_length] = byte
-                    name_length += 1
-                }
-                if name_length < NAME_WIDTH {
-                    store.name[name_base + name_length] = 41
-                    name_length += 1
-                }
-            }
-            cell := index * CELL_WIDTH
-            store.cell[base + Model.COLUMN_NAME] = TextView(store.name[name_base:name_base + name_length])
-            if entry.group_count > 1 {
-                store.cell[base + Model.COLUMN_PID] = "-"
-            } else {
-                store.cell[base + Model.COLUMN_PID] = Number.FormatInteger(cast(s64)entry.pid,
-                    store.pid[cell:cell + CELL_WIDTH])
-            }
-            store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
-                store.cpu[cell:cell + CELL_WIDTH])
-            store.cell[base + Model.COLUMN_CPU_TIME] = Model.FormatCpuTime(entry.ticks,
-                store.time[cell:cell + CELL_WIDTH])
-            store.cell[base + Model.COLUMN_MEMORY] = Model.FormatKilobytes(entry.memory_bytes,
-                store.mem[cell:cell + CELL_WIDTH])
+        } else {
+            entry = raw.processes[row.process_index]
+            if !selected_is_group && entry.pid == selected_pid { selected_row = index }
         }
+        base := index * COLUMNS
+        name_base := index * NAME_WIDTH
+        name_length: s32 = 0
+        if row.group_header {
+            if GroupExpanded(*entry) {
+                store.name[name_base] = 91; store.name[name_base + 1] = 45
+            } else {
+                store.name[name_base] = 91; store.name[name_base + 1] = 43
+            }
+            store.name[name_base + 2] = 93; store.name[name_base + 3] = 32
+            name_length = 4
+        } else if row.group_index >= 0 {
+            for indent: 0..3 { store.name[name_base + indent] = 32 }
+            name_length = 4
+        }
+        copy_count := entry.name_count
+        if copy_count > NAME_WIDTH - name_length { copy_count = NAME_WIDTH - name_length }
+        if copy_count > 0 {
+            for name_index: 0..copy_count - 1 {
+                store.name[name_base + name_length + name_index] = entry.name[name_index]
+            }
+            name_length += copy_count
+        }
+        if row.group_header && name_length < NAME_WIDTH {
+            store.name[name_base + name_length] = 32; name_length += 1
+            if name_length < NAME_WIDTH { store.name[name_base + name_length] = 40; name_length += 1 }
+            group_digits: [16]u8
+            group_text := Number.FormatInteger(cast(s64)entry.group_count, group_digits[:])
+            for byte: group_text {
+                if name_length >= NAME_WIDTH { break }
+                store.name[name_base + name_length] = byte
+                name_length += 1
+            }
+            if name_length < NAME_WIDTH { store.name[name_base + name_length] = 41; name_length += 1 }
+        }
+        cell := index * CELL_WIDTH
+        store.cell[base + Model.COLUMN_NAME] = TextView(store.name[name_base:name_base + name_length])
+        if row.group_header {
+            store.cell[base + Model.COLUMN_PID] = "-"
+        } else {
+            store.cell[base + Model.COLUMN_PID] = Number.FormatInteger(cast(s64)entry.pid,
+                store.pid[cell:cell + CELL_WIDTH])
+        }
+        store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
+            store.cpu[cell:cell + CELL_WIDTH])
+        store.cell[base + Model.COLUMN_CPU_TIME] = Model.FormatCpuTime(entry.ticks,
+            store.time[cell:cell + CELL_WIDTH])
+        store.cell[base + Model.COLUMN_MEMORY] = Model.FormatBytes(entry.memory_bytes,
+            store.mem[cell:cell + CELL_WIDTH])
     }
 }
 
@@ -411,6 +543,8 @@ RunMenu :: (id: s32) {
         group_processes = !group_processes
         selected_row = -1
         selected_pid = -1
+        selected_is_group = false
+        selected_group_name_count = 0
         selected_column = -1
         scroll_offset = 0
         pending_sort = true
@@ -543,33 +677,86 @@ EndSelectedProcess :: () {
     }
 }
 
-EndProcessDialog :: (session: Session) {
-    snapshot := Model.Current()
-    index := Model.FindProcess(snapshot, end_pid)
-    name_line: [NAME_WIDTH]u8
-    name_length: s32 = 0
-    if index >= 0 {
-        name_length = snapshot.processes[index].name_count
-        if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
-        if name_length > 0 {
-            for name_index: 0..name_length - 1 {
-                name_line[name_index] = snapshot.processes[index].name[name_index]
-            }
+FindNamedGroup :: (snapshot: *Model.Snapshot, name: []u8) -> s32 {
+    if snapshot.count > 0 {
+        for index: 0..snapshot.count - 1 {
+            if GroupNameMatches(name, *snapshot.processes[index]) { return index }
         }
     }
-    pid_line: [16]u8
-    message_line: [256]u8
-    parts: [5]string = .{"Ending a process can lose unsaved data or leave the system unstable. End ",
-        TextView(name_line[0:name_length]), " (PID ",
-        Number.FormatInteger(cast(s64)end_pid, pid_line[:]), ")?"}
+    return -1
+}
+
+EndSelectedGroup :: () {
+    grouped := Model.GroupedCurrent()
+    index := FindNamedGroup(grouped, end_group_name[0:end_group_name_count])
+    if index < 0 {
+        SetStatusText("That process group has already exited.")
+        return
+    }
+    group := *grouped.processes[index]
+    result := Model.EndProcessGroup(Model.Current(), group)
+    sent_line: [16]u8
+    failed_line: [16]u8
+    name_line := TextView(end_group_name[0:end_group_name_count])
+    if result.requested == 0 {
+        SetStatusText("That process group has already exited.")
+    } else if result.failed == 0 {
+        parts: [5]string = .{"Sent stop signal to ",
+            Number.FormatInteger(cast(s64)result.sent, sent_line[:]),
+            " processes in group ", name_line, "."}
+        SetStatus(parts[:])
+        refresh_requested = true
+    } else {
+        parts: [7]string = .{"Stopped ",
+            Number.FormatInteger(cast(s64)result.sent, sent_line[:]), " processes in ",
+            name_line, "; ", Number.FormatInteger(cast(s64)result.failed, failed_line[:]), " failed."}
+        SetStatus(parts[:])
+        refresh_requested = true
+    }
+}
+
+EndSelectedTarget :: () {
+    if end_is_group { EndSelectedGroup() } else { EndSelectedProcess() }
+}
+
+EndProcessDialog :: (session: Session) {
+    group_message_line: [256]u8
+    process_message_line: [256]u8
+    message: string
+    if end_is_group {
+        count_line: [16]u8
+        parts: [5]string = .{"Ending a process group can lose unsaved data. End all ",
+            Number.FormatInteger(cast(s64)end_group_members, count_line[:]),
+            " processes in group ", TextView(end_group_name[0:end_group_name_count]), "?"}
+        message = JoinAll(parts[:], group_message_line[:])
+    } else {
+        snapshot := Model.Current()
+        index := Model.FindProcess(snapshot, end_pid)
+        name_line: [NAME_WIDTH]u8
+        name_length: s32 = 0
+        if index >= 0 {
+            name_length = snapshot.processes[index].name_count
+            if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
+            if name_length > 0 {
+                for name_index: 0..name_length - 1 {
+                    name_line[name_index] = snapshot.processes[index].name[name_index]
+                }
+            }
+        }
+        pid_line: [16]u8
+        parts: [5]string = .{"Ending a process can lose unsaved data or leave the system unstable. End ",
+            TextView(name_line[0:name_length]), " (PID ",
+            Number.FormatInteger(cast(s64)end_pid, pid_line[:]), ")?"}
+        message = JoinAll(parts[:], process_message_line[:])
+    }
     actions: [2]ActionModalAction
     actions[0].label = "No"
     actions[1].label = "Yes"
     actions[1].tone = ButtonTone.ButtonToneDanger
     actions[1].emphasis = ButtonEmphasis.ButtonEmphasisFilled
     answer := ActionModal(session, ActionModalProps.{.key = 320, .title = "Task Manager Warning",
-        .message = JoinAll(parts[:], message_line[:]), .max_width = 460}, actions[:])
-    if answer.action == 2 { EndSelectedProcess() }
+        .message = message, .max_width = 460}, actions[:])
+    if answer.action == 2 { EndSelectedTarget() }
     if answer.action != 0 { dialog = DIALOG_NONE }
 }
 
@@ -633,25 +820,26 @@ ApplicationsTab :: (session: Session, area: Rectangle) {
 }
 
 ProcessesTab :: (session: Session, area: Rectangle) {
-    snapshot := ProcessSnapshot()
+    raw := Model.Current()
+    grouped_snapshot := Model.GroupedCurrent()
     table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
     if table_bounds.height < 60.0 { table_bounds.height = 60.0 }
-    table_rows: [Model.MAX_PROCESSES]Tables.TableRow
+    table_rows: [MAX_DISPLAY_ROWS]Tables.TableRow
     if text_active == 0 {
-        if snapshot.count > 0 {
-            for index: 0..snapshot.count - 1 {
+        if display_count > 0 {
+            for index: 0..display_count - 1 {
                 table_rows[index].cells = text_stores_a.cell[index * COLUMNS:(index + 1) * COLUMNS]
             }
         }
     } else {
-        if snapshot.count > 0 {
-            for index: 0..snapshot.count - 1 {
+        if display_count > 0 {
+            for index: 0..display_count - 1 {
                 table_rows[index].cells = text_stores_b.cell[index * COLUMNS:(index + 1) * COLUMNS]
             }
         }
     }
     table := Tables.TableView(session, Tables.TableViewProps.{.key = 100,
-        .bounds = table_bounds, .columns = process_columns[:], .rows = table_rows[0:snapshot.count],
+        .bounds = table_bounds, .columns = process_columns[:], .rows = table_rows[0:display_count],
         .column_widths = process_widths[:], .selected_row = selected_row,
         .selected_column = -1, .sort_column = sort_column,
         .sort_direction = sort_direction, .scroll_offset = scroll_offset,
@@ -661,8 +849,21 @@ ProcessesTab :: (session: Session, area: Rectangle) {
     selected_column = -1
     scroll_offset = table.scroll_offset
     selected_pid = -1
-    if selected_row >= 0 && selected_row < snapshot.count {
-        selected_pid = snapshot.processes[order[selected_row]].pid
+    selected_is_group = false
+    selected_group_name_count = 0
+    if selected_row >= 0 && selected_row < display_count {
+        row := display_rows[selected_row]
+        if row.group_header {
+            group := *grouped_snapshot.processes[row.group_index]
+            selected_is_group = true
+            selected_group_name_count = CopyGroupName(group, selected_group_name[:])
+            if table.clicked_row == selected_row && group.group_count > 1 {
+                ToggleGroup(group)
+                pending_sort = true
+            }
+        } else {
+            selected_pid = raw.processes[row.process_index].pid
+        }
     }
     if table.sort_column != sort_column || table.sort_direction != sort_direction {
         sort_column = table.sort_column
@@ -671,13 +872,27 @@ ProcessesTab :: (session: Session, area: Rectangle) {
     }
 
     button_y := area.y + area.height - BUTTON_HEIGHT
-    grouped := selected_row >= 0 && selected_row < snapshot.count &&
-        snapshot.processes[order[selected_row]].group_count > 1
-    none := selected_pid <= 0 || grouped
-    if TaskButton(session, 110, "End Process", .{area.x + area.width - BUTTON_WIDTH, button_y,
+    none := selected_pid <= 0 && !selected_is_group
+    button_label: string = "End Process"
+    if selected_is_group { button_label = "End Group" }
+    if TaskButton(session, 110, button_label, .{area.x + area.width - BUTTON_WIDTH, button_y,
             BUTTON_WIDTH, BUTTON_HEIGHT}, false, none) && !none {
-        end_pid = selected_pid
-        if confirm_end { dialog = DIALOG_END_PROCESS } else { EndSelectedProcess() }
+        end_is_group = selected_is_group
+        if end_is_group {
+            end_group_name_count = selected_group_name_count
+            if end_group_name_count > 0 {
+                for index: 0..end_group_name_count - 1 {
+                    end_group_name[index] = selected_group_name[index]
+                }
+            }
+            group_index := FindNamedGroup(grouped_snapshot,
+                end_group_name[0:end_group_name_count])
+            end_group_members = 0
+            if group_index >= 0 { end_group_members = grouped_snapshot.processes[group_index].group_count }
+        } else {
+            end_pid = selected_pid
+        }
+        if confirm_end { dialog = DIALOG_END_PROCESS } else { EndSelectedTarget() }
     }
 }
 
@@ -803,28 +1018,28 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         InfoRow(session, 445, totals_area, 2, "Processes", Model.FormatThousands(cast(s64)snapshot.count, c[:]), font)
 
         physical := Rectangle.{right_x, info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 450, .bounds = physical, .title = "Physical Memory (K)"})
+        Fieldset(session, FieldsetProps.{.key = 450, .bounds = physical, .title = "Physical Memory"})
         physical_area := GroupContent(physical)
         d: [32]u8
         e: [32]u8
         f: [32]u8
-        InfoRow(session, 451, physical_area, 0, "Total", Model.FormatThousands(details.total_kb, d[:]), font)
-        InfoRow(session, 453, physical_area, 1, "Available", Model.FormatThousands(details.available_kb, e[:]), font)
-        InfoRow(session, 455, physical_area, 2, "System Cache", Model.FormatThousands(details.cache_kb, f[:]), font)
+        InfoRow(session, 451, physical_area, 0, "Total", Model.FormatKilobytesBytes(details.total_kb, d[:]), font)
+        InfoRow(session, 453, physical_area, 1, "Available", Model.FormatKilobytesBytes(details.available_kb, e[:]), font)
+        InfoRow(session, 455, physical_area, 2, "System Cache", Model.FormatKilobytesBytes(details.cache_kb, f[:]), font)
 
         second_info_y := info_y + info_height + PAD
         commit := Rectangle.{area.x, second_info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 460, .bounds = commit, .title = "Commit Charge (K)"})
+        Fieldset(session, FieldsetProps.{.key = 460, .bounds = commit, .title = "Commit Charge"})
         commit_area := GroupContent(commit)
         g: [32]u8
         h: [32]u8
         i: [32]u8
-        InfoRow(session, 461, commit_area, 0, "Total", Model.FormatThousands(details.commit_kb, g[:]), font)
-        InfoRow(session, 463, commit_area, 1, "Limit", Model.FormatThousands(details.commit_limit_kb, h[:]), font)
-        InfoRow(session, 465, commit_area, 2, "Peak", Model.FormatThousands(Model.CommitPeakKb(), i[:]), font)
+        InfoRow(session, 461, commit_area, 0, "Total", Model.FormatKilobytesBytes(details.commit_kb, g[:]), font)
+        InfoRow(session, 463, commit_area, 1, "Limit", Model.FormatKilobytesBytes(details.commit_limit_kb, h[:]), font)
+        InfoRow(session, 465, commit_area, 2, "Peak", Model.FormatKilobytesBytes(Model.CommitPeakKb(), i[:]), font)
 
         kernel := Rectangle.{right_x, second_info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 470, .bounds = kernel, .title = "Kernel Memory (K)"})
+        Fieldset(session, FieldsetProps.{.key = 470, .bounds = kernel, .title = "Kernel Memory"})
         kernel_area := GroupContent(kernel)
         j: [32]u8
         k: [32]u8
@@ -833,9 +1048,9 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         if details.kernel_paged_kb >= 0 && details.kernel_nonpaged_kb >= 0 {
             kernel_total = details.kernel_paged_kb + details.kernel_nonpaged_kb
         }
-        InfoRow(session, 471, kernel_area, 0, "Total", Model.FormatThousands(kernel_total, j[:]), font)
-        InfoRow(session, 473, kernel_area, 1, "Paged", Model.FormatThousands(details.kernel_paged_kb, k[:]), font)
-        InfoRow(session, 475, kernel_area, 2, "Nonpaged", Model.FormatThousands(details.kernel_nonpaged_kb, l[:]), font)
+        InfoRow(session, 471, kernel_area, 0, "Total", Model.FormatKilobytesBytes(kernel_total, j[:]), font)
+        InfoRow(session, 473, kernel_area, 1, "Paged", Model.FormatKilobytesBytes(details.kernel_paged_kb, k[:]), font)
+        InfoRow(session, 475, kernel_area, 2, "Nonpaged", Model.FormatKilobytesBytes(details.kernel_nonpaged_kb, l[:]), font)
 }
 
 // The status bar: process count, CPU usage and memory in use, each in its
@@ -875,7 +1090,8 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
 #program_export
 Frame :: (session: Session, viewport: Rectangle) -> s32 {
     if !started {
-        unused SystemTheme.SystemPaletteInstall(SystemThemeLinux.SystemPaletteRead())
+        unused ThemeXInitThreads()
+        unused SystemTheme.SystemPaletteInstall(SystemThemeHostLinux.SystemPaletteRead())
         current_tab = StartingTab()
         started = true
     }

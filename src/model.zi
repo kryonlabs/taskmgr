@@ -59,6 +59,12 @@ Process :: struct {
     group_count: s32
 }
 
+GroupEndResult :: struct {
+    requested: s32
+    sent: s32
+    failed: s32
+}
+
 // Memory figures from /proc/meminfo, in kilobytes as the kernel reports them.
 // Commit charge is Committed_AS against CommitLimit; kernel memory is the slab
 // allocator, split into reclaimable (paged) and unreclaimable (nonpaged).
@@ -392,6 +398,7 @@ IsCodexProcessName :: (name: []u8) -> bool {
     return true
 }
 
+#program_export
 SameProcessGroup :: (left: *Process, right: *Process) -> bool {
     left_name := left.name[0:left.name_count]
     right_name := right.name[0:right.name_count]
@@ -829,6 +836,14 @@ FormatKilobytes :: (bytes: u64, output: []u8) -> string {
     return TextView(output[0:length])
 }
 
+// Converts a /proc meminfo value to an adaptive, explicit unit. Missing
+// figures stay "n/a" instead of looking like a real zero-byte measurement.
+#program_export
+FormatKilobytesBytes :: (kilobytes: s64, output: []u8) -> string {
+    if kilobytes < 0 { return "n/a" }
+    return FormatBytes(cast(u64)kilobytes * cast(u64)1024, output)
+}
+
 // CPU time from clock ticks as H:MM:SS.
 #program_export
 FormatCpuTime :: (ticks: u64, output: []u8) -> string {
@@ -886,4 +901,20 @@ StartTask :: (command: string) -> bool {
 EndTask :: (pid: s32) -> bool {
     if pid <= 0 { return false }
     return SendSignal(pid, STOP_SIGNAL) == 0
+}
+
+// Sends SIGTERM to every current raw process represented by GROUP. The
+// caller gets exact counts so the interface can report partial failure.
+#program_export
+EndProcessGroup :: (source: *Snapshot, group: *Process) -> GroupEndResult {
+    result: GroupEndResult
+    if group.name_count <= 0 || source.count <= 0 { return result }
+    for index: 0..source.count - 1 {
+        entry := *source.processes[index]
+        if SameProcessGroup(group, entry) {
+            result.requested += 1
+            if EndTask(entry.pid) { result.sent += 1 } else { result.failed += 1 }
+        }
+    }
+    return result
 }

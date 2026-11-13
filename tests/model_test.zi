@@ -267,8 +267,10 @@ FormatTest :: () -> bool {
         print("format: thousands separators wrong\n")
         return false
     }
-    if Model.FormatKilobytes(cast(u64)12345 * 1024, buffer[:]) != "12,345 K" {
-        print("format: mem usage column wrong\n")
+    if Model.FormatKilobytesBytes(1048576, buffer[:]) != "1 GB" ||
+       Model.FormatKilobytesBytes(1536, buffer[:]) != "1.5 MB" ||
+       Model.FormatKilobytesBytes(-1, buffer[:]) != "n/a" {
+        print("format: adaptive meminfo units wrong\n")
         return false
     }
     if Model.FormatCpu(7.4, buffer[:]) != "07" || Model.FormatCpu(42.6, buffer[:]) != "43" ||
@@ -409,6 +411,53 @@ SignalTest :: () -> bool {
     return true
 }
 
+GroupSignalTest :: () -> bool {
+    first := TestFork()
+    if first < 0 {
+        print("group signal: could not create first child\n")
+        return false
+    }
+    if first == 0 {
+        unused TestPause()
+        TestExit(71)
+        return false
+    }
+    second := TestFork()
+    if second < 0 {
+        unused TestKill(first, 9)
+        cleanup_status: s32
+        unused TestWait(first, *cleanup_status, 0)
+        print("group signal: could not create second child\n")
+        return false
+    }
+    if second == 0 {
+        unused TestPause()
+        TestExit(72)
+        return false
+    }
+    source: Model.Snapshot
+    group: Model.Process
+    source.count = 2
+    source.processes[0].pid = first
+    source.processes[1].pid = second
+    SetProcessName(*source.processes[0], "group-signal-test")
+    SetProcessName(*source.processes[1], "GROUP-SIGNAL-TEST")
+    SetProcessName(*group, "group-signal-test")
+    result := Model.EndProcessGroup(*source, *group)
+    first_status: s32
+    second_status: s32
+    first_wait := TestWait(first, *first_status, 0)
+    second_wait := TestWait(second, *second_status, 0)
+    if result.requested != 2 || result.sent != 2 || result.failed != 0 ||
+       first_wait != first || second_wait != second ||
+       (first_status & 127) != Model.STOP_SIGNAL ||
+       (second_status & 127) != Model.STOP_SIGNAL {
+        print("group signal: did not stop every matching process\n")
+        return false
+    }
+    return true
+}
+
 main :: (argc: s32, argv: **u8) -> s32 {
     if argc != 1 {
         print("usage: model_test\n")
@@ -420,6 +469,7 @@ main :: (argc: s32, argv: **u8) -> s32 {
     if !SortTest() { print("sort test failed\n"); return 67 }
     if !FormatTest() { print("format test failed\n"); return 68 }
     if !SignalTest() { print("signal binding test failed\n"); return 69 }
+    if !GroupSignalTest() { print("group signal test failed\n"); return 73 }
     if !HistoryTest() { print("history test failed\n"); return 70 }
     if !StartTaskTest() { print("start task test failed\n"); return 71 }
     print("taskmgr model tests passed\n")
