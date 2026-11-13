@@ -1,4 +1,5 @@
 using Model :: #import "model";
+Shortcuts :: #import "app_shortcuts";
 Files :: #import "std/file";
 
 test_libc :: #system_library "libc";
@@ -99,7 +100,7 @@ ScanTest :: () -> bool {
         print("scan: total cpu percent out of range\n")
         return false
     }
-    if snapshot.gpu_count > 0 &&
+    if snapshot.gpu_supported_count > 0 &&
        (snapshot.gpu_percent < 0.0 || snapshot.gpu_percent > 100.0) {
         print("scan: GPU percent out of range\n")
         return false
@@ -107,6 +108,31 @@ ScanTest :: () -> bool {
     if snapshot.vram_total > 0 && snapshot.vram_used > snapshot.vram_total {
         print("scan: VRAM usage exceeds total\n")
         return false
+    }
+    if snapshot.gpu_count > Model.MAX_GPUS {
+        print("scan: too many GPU devices\n")
+        return false
+    }
+    if snapshot.gpu_count > 0 {
+        previous: s32 = -1
+        for gpu_index: 0..snapshot.gpu_count - 1 {
+            device := snapshot.gpus[gpu_index]
+            if device.card_index <= previous {
+                print("scan: GPU device order is not stable\n")
+                return false
+            }
+            previous = device.card_index
+            if device.busy_supported &&
+               (device.busy_percent < 0.0 || device.busy_percent > 100.0) {
+                print("scan: per-device GPU percent out of range\n")
+                return false
+            }
+            if device.vram_supported &&
+               (device.vram_total == 0 || device.vram_used > device.vram_total) {
+                print("scan: per-device VRAM counters invalid\n")
+                return false
+            }
+        }
     }
     mine := Model.CurrentProcessId()
     index := Model.FindProcess(snapshot, mine)
@@ -142,6 +168,76 @@ ScanTest :: () -> bool {
     return true
 }
 
+GpuFixtureTest :: () -> bool {
+    snapshot: Model.Snapshot
+    busy_75: [8]u8
+    used_25: [8]u8
+    total_100: [8]u8
+    busy_0: [8]u8
+    used_0: [8]u8
+    total_800: [8]u8
+    empty: [1]u8
+    bad_used: [8]u8
+    bad_total: [8]u8
+    // Add out of order to prove that card labels and histories are stable.
+    Model.AddGpuCounters(*snapshot, 1, BytesOf("75\n", busy_75[:]),
+        BytesOf("25\n", used_25[:]), BytesOf("100\n", total_100[:]))
+    Model.AddGpuCounters(*snapshot, 0, BytesOf("0\n", busy_0[:]),
+        BytesOf("0\n", used_0[:]), BytesOf("800\n", total_800[:]))
+    Model.AddGpuCounters(*snapshot, 2, empty[0:0],
+        BytesOf("101\n", bad_used[:]), BytesOf("100\n", bad_total[:]))
+    Model.FinalizeGpuStats(*snapshot)
+    if snapshot.gpu_count != 3 || snapshot.gpu_supported_count != 2 ||
+       snapshot.gpus[0].card_index != 0 || snapshot.gpus[1].card_index != 1 ||
+       snapshot.gpus[2].card_index != 2 || snapshot.gpu_percent != 37.5 {
+        print("gpu: detection, stable ordering or aggregate busy usage wrong\n")
+        return false
+    }
+    if !snapshot.gpus[0].vram_supported ||
+       Model.GpuVramPercent(*snapshot.gpus[0]) != 0.0 {
+        print("gpu: zero VRAM usage did not remain zero\n")
+        return false
+    }
+    if Model.GpuVramPercent(*snapshot.gpus[1]) != 25.0 ||
+       snapshot.gpus[2].vram_supported ||
+       Model.GpuVramPercent(*snapshot.gpus[2]) != -1.0 {
+        print("gpu: VRAM percentage or unsupported state wrong\n")
+        return false
+    }
+    if snapshot.vram_used != 25 || snapshot.vram_total != 900 {
+        print("gpu: aggregate VRAM counters wrong\n")
+        return false
+    }
+    Model.PushGpuDeviceHistories(*snapshot)
+    Model.PushHistoryExtended(0.0, 0.0, 0.0, snapshot.gpu_percent,
+        100.0 * cast(float64)snapshot.vram_used / cast(float64)snapshot.vram_total)
+    values: [Model.HISTORY_LENGTH]float32
+    last := Model.HISTORY_LENGTH - 1
+    if Model.GpuHistory(Model.HISTORY_GPU, 0, values[:])[last] != 0.0 ||
+       Model.GpuHistory(Model.HISTORY_GPU, 1, values[:])[last] != 75.0 ||
+       Model.GpuHistory(Model.HISTORY_VRAM, 0, values[:])[last] != 0.0 ||
+       Model.GpuHistory(Model.HISTORY_VRAM, 1, values[:])[last] != 25.0 {
+        print("gpu: per-device histories wrong\n")
+        return false
+    }
+    return true
+}
+
+ShortcutTest :: () -> bool {
+    if Shortcuts.TabForShortcut(49, Shortcuts.CONTROL_MODIFIER) != 0 ||
+       Shortcuts.TabForShortcut(50, Shortcuts.CONTROL_MODIFIER) != 1 ||
+       Shortcuts.TabForShortcut(51, Shortcuts.CONTROL_MODIFIER) != 2 {
+        print("shortcut: Ctrl+1/2/3 tab order wrong\n")
+        return false
+    }
+    if Shortcuts.TabForShortcut(49, 0) != -1 ||
+       Shortcuts.TabForShortcut(52, Shortcuts.CONTROL_MODIFIER) != -1 {
+        print("shortcut: missing Control or unrelated key accepted\n")
+        return false
+    }
+    return true
+}
+
 SetProcessName :: (process: *Model.Process, name: string) {
     process.name_count = cast(s32)name.count
     for index: 0..process.name_count - 1 { process.name[index] = name[index] }
@@ -149,7 +245,7 @@ SetProcessName :: (process: *Model.Process, name: string) {
 
 GroupingTest :: () -> bool {
     source: Model.Snapshot
-    grouped: Model.Snapshot
+    grouped: Model.GroupedSnapshot
     source.count = 4
     SetProcessName(*source.processes[0], "codex")
     SetProcessName(*source.processes[1], "codex-linux-x64")
@@ -166,16 +262,32 @@ GroupingTest :: () -> bool {
         print("grouping: expected two image-name groups\n")
         return false
     }
-    codex := grouped.processes[0]
+    codex := Model.GroupProcess(*source, *grouped.groups[0])
     if TextView(codex.name[0:codex.name_count]) != "codex" ||
        codex.group_count != 2 || codex.memory_bytes != 300 ||
        codex.ticks != 50 || codex.cpu_percent != 4.0 {
         print("grouping: Codex family did not aggregate under codex\n")
         return false
     }
-    shell := grouped.processes[1]
+    shell := Model.GroupProcess(*source, *grouped.groups[1])
     if shell.group_count != 2 || shell.memory_bytes != 700 {
         print("grouping: case-insensitive image group is wrong\n")
+        return false
+    }
+    order: [Model.MAX_PROCESSES]s32
+    Model.SortGroupOrder(*source, *grouped, order[:], Model.COLUMN_NAME, 1)
+    if order[0] != 1 || order[1] != 0 {
+        print("grouping: aggregate name ordering is wrong\n")
+        return false
+    }
+    Model.SortGroupOrder(*source, *grouped, order[:], Model.COLUMN_CPU, -1)
+    if order[0] != 0 || order[1] != 1 {
+        print("grouping: aggregate CPU ordering is wrong\n")
+        return false
+    }
+    Model.SortGroupOrder(*source, *grouped, order[:], Model.COLUMN_MEMORY, -1)
+    if order[0] != 1 || order[1] != 0 {
+        print("grouping: aggregate memory ordering is wrong\n")
         return false
     }
     return true
@@ -464,6 +576,8 @@ main :: (argc: s32, argv: **u8) -> s32 {
         return 64
     }
     if !ParserTest() { print("parser fixture test failed\n"); return 65 }
+    if !GpuFixtureTest() { print("GPU fixture test failed\n"); return 74 }
+    if !ShortcutTest() { print("shortcut test failed\n"); return 75 }
     if !ScanTest() { print("scan/snapshot test failed\n"); return 66 }
     if !GroupingTest() { print("process grouping test failed\n"); return 72 }
     if !SortTest() { print("sort test failed\n"); return 67 }

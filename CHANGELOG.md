@@ -11,6 +11,13 @@
   after multiple process refreshes and enforces the 30 MiB limit.
 - System-theme colors now cover the whole page, tabs, process panel and status
   panes instead of leaving mixed hard-coded white surfaces.
+- Performance graphs use classic Windows-style colors and show each detected
+  GPU with a stable card label, distinct usage/VRAM history and explicit `n/a`
+  for unsupported driver counters.
+- Fixed VRAM readings that could appear 100% used because the used and total
+  sysfs reads shared a buffer; zero usage now remains 0%.
+- Ctrl+1, Ctrl+2 and Ctrl+3 switch to Applications, Processes and Performance
+  in visible tab order.
 
 ## [0.1.1] - 2026-11-12
 

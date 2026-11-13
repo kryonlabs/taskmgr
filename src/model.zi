@@ -1,8 +1,8 @@
 // Process and system metrics read from /proc on Linux, plus the ordering and
-// formatting helpers the taskmgr interface uses. Refresh keeps two snapshots
-// and swaps between them each call, so CPU percentages come from the previous
-// sample without copying snapshot storage, and appends each sample to the
-// CPU, kernel CPU and memory histories the Performance graphs draw.
+// formatting helpers the taskmgr interface uses. Refresh keeps one raw
+// snapshot plus compact previous PID/tick arrays for CPU deltas, and appends
+// each sample to the CPU, kernel CPU and memory histories the Performance
+// graphs draw.
 using Files :: #import "std/file";
 Number :: #import "std/number_text";
 
@@ -19,9 +19,10 @@ STOP_SIGNAL :: 15; // SIGTERM
 // Keep the fixed snapshot bounded, but large enough for development hosts and
 // servers with several thousand visible processes. A lower cap silently hid
 // rows (including taskmgr's own test process) once /proc exceeded 1,024 PIDs.
-// Four thousand entries retain that headroom without reserving the much larger
-// table and text generations an 8,192-entry snapshot required.
-MAX_PROCESSES :: 4096;
+// Two thousand entries retain that headroom on the development host (which
+// runs roughly 1,400 processes) without keeping unused process and UI rows in
+// every retained generation.
+MAX_PROCESSES :: 2048;
 // Linux TASK_COMM_LEN is 16 including the terminator. Keep extra room for
 // synthetic group labels without doubling every process snapshot row.
 NAME_CAPACITY :: 32;
@@ -42,6 +43,8 @@ HISTORY_KERNEL :: 1;
 HISTORY_MEMORY :: 2;
 HISTORY_GPU :: 3;
 HISTORY_VRAM :: 4;
+MAX_GPUS :: 16;
+GPU_CARD_LIMIT :: 64;
 
 STATE_RUNNING :: 82; // R
 STATE_SLEEPING :: 83; // S
@@ -84,6 +87,18 @@ MemoryDetails :: struct {
     swap_free_kb: s64
 }
 
+// One stable DRM card. card_index comes from cardN, so labels and histories do
+// not change when directory enumeration order does. Unsupported counters stay
+// explicit instead of looking like 0% or 100% usage.
+GpuDevice :: struct {
+    card_index: s32
+    busy_supported: bool
+    busy_percent: float64
+    vram_supported: bool
+    vram_used: u64
+    vram_total: u64
+}
+
 Snapshot :: struct {
     processes: [MAX_PROCESSES]Process
     count: s32
@@ -99,15 +114,40 @@ Snapshot :: struct {
     handles: s64
     memory: MemoryDetails
     gpu_percent: float64
+    gpus: [MAX_GPUS]GpuDevice
     gpu_count: s32
+    gpu_supported_count: s32
     vram_used: u64
     vram_total: u64
 }
 
+// Group rows retain only the representative raw-process index and the values
+// that are actually aggregated for the process table. Keeping a third full
+// Snapshot duplicated every process name, state and GPU/system field.
+ProcessGroup :: struct {
+    process_index: s32
+    group_count: s32
+    cpu_percent: float64
+    memory_bytes: u64
+    ticks: u64
+}
+
+GroupedSnapshot :: struct {
+    groups: [MAX_PROCESSES]ProcessGroup
+    count: s32
+}
+
 state_names: [7]string = .{"Running", "Sleeping", "Waiting", "Stopped", "Zombie", "Idle", "Other"};
 
-snapshots: [2]Snapshot;
-active: s32;
+snapshot: Snapshot;
+// Only PID/ticks plus the three system counters are needed from the preceding
+// sample to calculate CPU deltas. This replaces a second full raw snapshot.
+previous_pids: [MAX_PROCESSES]s32;
+previous_process_ticks: [MAX_PROCESSES]u64;
+previous_count: s32;
+previous_busy_ticks: u64;
+previous_kernel_ticks: u64;
+previous_total_ticks: u64;
 // The highest commit charge seen while taskmgr runs.
 commit_peak_kb: s64;
 
@@ -117,20 +157,22 @@ kernel_history: [HISTORY_LENGTH]float32;
 memory_history: [HISTORY_LENGTH]float32;
 gpu_history: [HISTORY_LENGTH]float32;
 vram_history: [HISTORY_LENGTH]float32;
+gpu_device_history: [GPU_CARD_LIMIT * HISTORY_LENGTH]float32;
+vram_device_history: [GPU_CARD_LIMIT * HISTORY_LENGTH]float32;
 history_next: s32;
 history_count: s32;
 clock_ticks: float64;
 page_bytes: u64;
 timing_ready: bool;
-grouped_snapshot: Snapshot;
+grouped_snapshot: GroupedSnapshot;
 
 #program_export
 Current :: () -> *Snapshot {
-    return *snapshots[active]
+    return *snapshot
 }
 
 #program_export
-GroupedCurrent :: () -> *Snapshot {
+GroupedCurrent :: () -> *GroupedSnapshot {
     return *grouped_snapshot
 }
 
@@ -337,6 +379,18 @@ IsDrmCardName :: (name: []u8) -> bool {
     return true
 }
 
+DrmCardIndex :: (name: []u8) -> s32 {
+    if !IsDrmCardName(name) { return -1 }
+    value: s32 = 0
+    for index: 4..cast(s32)name.count - 1 {
+        digit := cast(s32)(name[index] - 48)
+        if value > (GPU_CARD_LIMIT - 1 - digit) / 10 { return -1 }
+        value = value * 10 + digit
+    }
+    if value >= GPU_CARD_LIMIT { return -1 }
+    return value
+}
+
 DrmPath :: (card: []u8, leaf: string, output: []u8) -> string {
     length := Append(output, 0, "/sys/class/drm/")
     for byte: card {
@@ -349,42 +403,86 @@ DrmPath :: (card: []u8, leaf: string, output: []u8) -> string {
     return TextView(output[0:length])
 }
 
-// Samples every DRM card that exposes the standard Linux sysfs counters.
-// Usage is the average busy percentage; VRAM is summed across the adapters.
+// Adds one card's independent sysfs buffers, keeping card order stable. A zero
+// used counter is valid. Missing totals and inconsistent used > total pairs are
+// unsupported, never interpreted as fully used.
+#program_export
+AddGpuCounters :: (snapshot: *Snapshot, card_index: s32,
+    busy_text: []u8, used_text: []u8, total_text: []u8) {
+    if card_index < 0 || card_index >= GPU_CARD_LIMIT || snapshot.gpu_count >= MAX_GPUS { return }
+    device: GpuDevice
+    device.card_index = card_index
+    busy := FirstNumber(busy_text)
+    if busy >= 0 {
+        if busy > 100 { busy = 100 }
+        device.busy_supported = true
+        device.busy_percent = cast(float64)busy
+        snapshot.gpu_percent += device.busy_percent
+        snapshot.gpu_supported_count += 1
+    }
+    used := FirstNumber(used_text)
+    total := FirstNumber(total_text)
+    if used >= 0 && total > 0 && used <= total {
+        device.vram_supported = true
+        device.vram_used = cast(u64)used
+        device.vram_total = cast(u64)total
+        snapshot.vram_used += device.vram_used
+        snapshot.vram_total += device.vram_total
+    }
+    position := snapshot.gpu_count
+    while position > 0 && snapshot.gpus[position - 1].card_index > card_index {
+        snapshot.gpus[position] = snapshot.gpus[position - 1]
+        position -= 1
+    }
+    snapshot.gpus[position] = device
+    snapshot.gpu_count += 1
+}
+
+#program_export
+FinalizeGpuStats :: (snapshot: *Snapshot) {
+    if snapshot.gpu_supported_count > 0 {
+        snapshot.gpu_percent /= cast(float64)snapshot.gpu_supported_count
+    } else {
+        snapshot.gpu_percent = 0
+    }
+}
+
+#program_export
+GpuVramPercent :: (device: *GpuDevice) -> float64 {
+    if !device.vram_supported || device.vram_total == 0 || device.vram_used > device.vram_total {
+        return -1.0
+    }
+    return 100.0 * cast(float64)device.vram_used / cast(float64)device.vram_total
+}
+
+// Samples every DRM card that exposes standard Linux sysfs counters. Each
+// counter has its own buffer: reading total must not overwrite used before it
+// is parsed (the previous alias made every adapter appear 100% full).
 ReadGpuStats :: (snapshot: *Snapshot) {
     directory := Files.OpenDirectory("/sys/class/drm")
-    buffer: [128]u8
+    busy_buffer: [128]u8
+    used_buffer: [128]u8
+    total_buffer: [128]u8
     path: [160]u8
-    gpu_sum: s64 = 0
     while true {
         entry := Files.NextDirectoryEntry(*directory)
         if !entry.valid { break }
         card := entry.name[0:entry.name_count]
-        if !IsDrmCardName(card) { continue }
-        length := ReadSmall(DrmPath(card, "gpu_busy_percent", path[:]), buffer[:])
-        if length > 0 {
-            busy := FirstNumber(buffer[0:length])
-            if busy >= 0 {
-                if busy > 100 { busy = 100 }
-                gpu_sum += busy
-                snapshot.gpu_count += 1
-            }
-        }
-        used_length := ReadSmall(DrmPath(card, "mem_info_vram_used", path[:]), buffer[:])
-        total_length := ReadSmall(DrmPath(card, "mem_info_vram_total", path[:]), buffer[:])
-        if used_length > 0 && total_length > 0 {
-            used := FirstNumber(buffer[0:used_length])
-            total := FirstNumber(buffer[0:total_length])
-            if used >= 0 && total > 0 {
-                snapshot.vram_used += cast(u64)used
-                snapshot.vram_total += cast(u64)total
-            }
-        }
+        card_index := DrmCardIndex(card)
+        if card_index < 0 { continue }
+        busy_length := ReadSmall(DrmPath(card, "gpu_busy_percent", path[:]), busy_buffer[:])
+        used_length := ReadSmall(DrmPath(card, "mem_info_vram_used", path[:]), used_buffer[:])
+        total_length := ReadSmall(DrmPath(card, "mem_info_vram_total", path[:]), total_buffer[:])
+        busy_text: []u8 = busy_buffer[0:0]
+        used_text: []u8 = used_buffer[0:0]
+        total_text: []u8 = total_buffer[0:0]
+        if busy_length > 0 { busy_text = busy_buffer[0:busy_length] }
+        if used_length > 0 { used_text = used_buffer[0:used_length] }
+        if total_length > 0 { total_text = total_buffer[0:total_length] }
+        AddGpuCounters(snapshot, card_index, busy_text, used_text, total_text)
     }
     Files.CloseDirectory(*directory)
-    if snapshot.gpu_count > 0 {
-        snapshot.gpu_percent = cast(float64)gpu_sum / cast(float64)snapshot.gpu_count
-    }
+    FinalizeGpuStats(snapshot)
 }
 
 LowerByte :: (byte: u8) -> u8 {
@@ -416,18 +514,20 @@ SameProcessGroup :: (left: *Process, right: *Process) -> bool {
     return true
 }
 
-// Aggregates processes with the same image name. Codex-family names share the
-// canonical lower-case "codex" group requested by the process-table option.
+// Aggregates processes with the same image name without copying every Process
+// field into a third full snapshot.
 #program_export
-BuildGroupedSnapshot :: (source: *Snapshot, target: *Snapshot) {
+BuildGroupedSnapshot :: (source: *Snapshot, target: *GroupedSnapshot) {
     target.count = 0
     if source.count <= 0 { return }
     for index: 0..source.count - 1 {
-        entry := source.processes[index]
+        entry := *source.processes[index]
         group: s32 = -1
         if target.count > 0 {
             for candidate: 0..target.count - 1 {
-                if SameProcessGroup(*target.processes[candidate], *entry) {
+                representative := target.groups[candidate].process_index
+                if representative >= 0 && representative < source.count &&
+                   SameProcessGroup(*source.processes[representative], entry) {
                     group = candidate
                     break
                 }
@@ -435,25 +535,41 @@ BuildGroupedSnapshot :: (source: *Snapshot, target: *Snapshot) {
         }
         if group < 0 {
             group = target.count
-            target.processes[group] = entry
-            target.processes[group].group_count = 1
-            if IsCodexProcessName(entry.name[0:entry.name_count]) {
-                target.processes[group].name_count = 5
-                target.processes[group].name[0] = 99
-                target.processes[group].name[1] = 111
-                target.processes[group].name[2] = 100
-                target.processes[group].name[3] = 101
-                target.processes[group].name[4] = 120
-            }
+            target.groups[group].process_index = index
+            target.groups[group].group_count = 1
+            target.groups[group].cpu_percent = entry.cpu_percent
+            target.groups[group].memory_bytes = entry.memory_bytes
+            target.groups[group].ticks = entry.ticks
             target.count += 1
         } else {
-            target.processes[group].cpu_percent += entry.cpu_percent
-            target.processes[group].memory_bytes += entry.memory_bytes
-            target.processes[group].ticks += entry.ticks
-            target.processes[group].threads += entry.threads
-            target.processes[group].group_count += 1
+            target.groups[group].cpu_percent += entry.cpu_percent
+            target.groups[group].memory_bytes += entry.memory_bytes
+            target.groups[group].ticks += entry.ticks
+            target.groups[group].group_count += 1
         }
     }
+}
+
+// Materializes one compact group as a Process only for the caller's immediate
+// formatting or comparison. Codex-family aliases keep their canonical label.
+#program_export
+GroupProcess :: (source: *Snapshot, group: *ProcessGroup) -> Process {
+    result: Process
+    if group.process_index < 0 || group.process_index >= source.count { return result }
+    result = source.processes[group.process_index]
+    result.cpu_percent = group.cpu_percent
+    result.memory_bytes = group.memory_bytes
+    result.ticks = group.ticks
+    result.group_count = group.group_count
+    if IsCodexProcessName(result.name[0:result.name_count]) {
+        result.name_count = 5
+        result.name[0] = 99
+        result.name[1] = 111
+        result.name[2] = 100
+        result.name[3] = 101
+        result.name[4] = 120
+    }
+    return result
 }
 
 // Reads the memory figures the Performance tab shows from /proc/meminfo text.
@@ -514,11 +630,11 @@ LineKb :: (content: []u8, label: string) -> s64 {
     return -1
 }
 
-FindTicks :: (snapshot: *Snapshot, pid: s32) -> (found: bool, ticks: u64) {
-    if snapshot.count > 0 {
-        for index: 0..snapshot.count - 1 {
-            if snapshot.processes[index].pid == pid {
-                return true, snapshot.processes[index].ticks
+FindPreviousTicks :: (pid: s32) -> (found: bool, ticks: u64) {
+    if previous_count > 0 {
+        for index: 0..previous_count - 1 {
+            if previous_pids[index] == pid {
+                return true, previous_process_ticks[index]
             }
         }
     }
@@ -535,13 +651,22 @@ FindProcess :: (snapshot: *Snapshot, pid: s32) -> s32 {
     return -1
 }
 
-// Samples /proc once into the next snapshot slot and swaps it in. CPU
-// percentages use the delta against the retained previous snapshot.
+// Samples /proc into the live snapshot. CPU percentages use compact PID/tick
+// arrays and system counters retained from the previous sample.
 #program_export
 Refresh :: () {
     EnsureTiming()
-    target := *snapshots[1 - active]
-    previous := *snapshots[active]
+    previous_count = snapshot.count
+    if previous_count > 0 {
+        for index: 0..previous_count - 1 {
+            previous_pids[index] = snapshot.processes[index].pid
+            previous_process_ticks[index] = snapshot.processes[index].ticks
+        }
+    }
+    previous_busy_ticks = snapshot.busy_ticks
+    previous_kernel_ticks = snapshot.kernel_ticks
+    previous_total_ticks = snapshot.total_ticks
+    target := *snapshot
     target.count = 0
     target.cpu_percent = 0
     target.kernel_percent = 0
@@ -555,6 +680,7 @@ Refresh :: () {
     target.memory = MemoryDetails.{}
     target.gpu_percent = 0
     target.gpu_count = 0
+    target.gpu_supported_count = 0
     target.vram_used = 0
     target.vram_total = 0
 
@@ -606,10 +732,10 @@ Refresh :: () {
         if !ParseStat(stat_buffer[0:length], *process) { continue }
         process.cpu_percent = 0
         process.group_count = 1
-        found, previous_ticks := FindTicks(previous, pid)
-        if found && process.ticks >= previous_ticks && total_ticks > previous.total_ticks {
+        found, previous_ticks := FindPreviousTicks(pid)
+        if found && process.ticks >= previous_ticks && total_ticks > previous_total_ticks {
             delta := cast(float64)(process.ticks - previous_ticks)
-            span := cast(float64)(total_ticks - previous.total_ticks)
+            span := cast(float64)(total_ticks - previous_total_ticks)
             process.cpu_percent = 100.0 * delta / span
         }
         target.processes[target.count] = process
@@ -621,18 +747,17 @@ Refresh :: () {
     target.busy_ticks = busy
     target.kernel_ticks = kernel_ticks
     target.total_ticks = total_ticks
-    if previous.total_ticks > 0 && total_ticks > previous.total_ticks && busy >= previous.busy_ticks {
-        delta_busy := cast(float64)(busy - previous.busy_ticks)
-        span := cast(float64)(total_ticks - previous.total_ticks)
+    if previous_total_ticks > 0 && total_ticks > previous_total_ticks && busy >= previous_busy_ticks {
+        delta_busy := cast(float64)(busy - previous_busy_ticks)
+        span := cast(float64)(total_ticks - previous_total_ticks)
         target.cpu_percent = 100.0 * delta_busy / span
-        if kernel_ticks >= previous.kernel_ticks {
-            target.kernel_percent = 100.0 * cast(float64)(kernel_ticks - previous.kernel_ticks) / span
+        if kernel_ticks >= previous_kernel_ticks {
+            target.kernel_percent = 100.0 * cast(float64)(kernel_ticks - previous_kernel_ticks) / span
         }
     }
     BuildGroupedSnapshot(target, *grouped_snapshot)
-    active = 1 - active
     // The first sample has no previous one to measure CPU time against.
-    if previous.total_ticks > 0 {
+    if previous_total_ticks > 0 {
         memory_percent: float64 = 0
         if target.memory_total > 0 {
             memory_percent = 100.0 * cast(float64)target.memory_used / cast(float64)target.memory_total
@@ -641,6 +766,7 @@ Refresh :: () {
         if target.vram_total > 0 {
             vram_percent = 100.0 * cast(float64)target.vram_used / cast(float64)target.vram_total
         }
+        PushGpuDeviceHistories(target)
         PushHistoryExtended(target.cpu_percent, target.kernel_percent, memory_percent,
             target.gpu_percent, vram_percent)
     }
@@ -650,6 +776,29 @@ ClampPercent :: (value: float64) -> float32 {
     if value < 0.0 { return 0.0 }
     if value > 100.0 { return 100.0 }
     return cast(float32)value
+}
+
+// Device history uses the same ring slot as the aggregate histories. Missing
+// counters write zero but remain explicitly unsupported in the live snapshot,
+// so the UI can omit their series and label them n/a.
+#program_export
+PushGpuDeviceHistories :: (snapshot: *Snapshot) {
+    for card: 0..GPU_CARD_LIMIT - 1 {
+        offset := card * HISTORY_LENGTH + history_next
+        gpu_device_history[offset] = 0.0
+        vram_device_history[offset] = 0.0
+    }
+    if snapshot.gpu_count <= 0 { return }
+    for index: 0..snapshot.gpu_count - 1 {
+        device := *snapshot.gpus[index]
+        if device.card_index < 0 || device.card_index >= GPU_CARD_LIMIT { continue }
+        offset := device.card_index * HISTORY_LENGTH + history_next
+        if device.busy_supported {
+            gpu_device_history[offset] = ClampPercent(device.busy_percent)
+        }
+        vram := GpuVramPercent(device)
+        if vram >= 0.0 { vram_device_history[offset] = ClampPercent(vram) }
+    }
 }
 
 #program_export
@@ -694,6 +843,27 @@ History :: (kind: s32, output: []float32) -> []float32 {
     return output[0:length]
 }
 
+// Copies one stable card's GPU or VRAM history, oldest first.
+#program_export
+GpuHistory :: (kind: s32, card_index: s32, output: []float32) -> []float32 {
+    length: s32 = HISTORY_LENGTH
+    if length > cast(s32)output.count { length = cast(s32)output.count }
+    if length <= 0 || card_index < 0 || card_index >= GPU_CARD_LIMIT { return output[0:0] }
+    for index: 0..length - 1 { output[index] = 0.0 }
+    shown := history_count
+    if shown > length { shown = length }
+    if shown > 0 {
+        for step: 0..shown - 1 {
+            slot := (history_next - shown + step + HISTORY_LENGTH) % HISTORY_LENGTH
+            offset := card_index * HISTORY_LENGTH + slot
+            value := gpu_device_history[offset]
+            if kind == HISTORY_VRAM { value = vram_device_history[offset] }
+            output[length - shown + step] = value
+        }
+    }
+    return output[0:length]
+}
+
 // Clock ticks per second, as /proc reports CPU time.
 #program_export
 ClockTicks :: () -> float64 {
@@ -718,34 +888,37 @@ CompareName :: (left: []u8, right: []u8) -> s32 {
     return 0
 }
 
-CompareRows :: (snapshot: *Snapshot, left: s32, right: s32, column: s32) -> s32 {
-    if left == right { return 0 }
-    if left < 0 || right < 0 || left >= snapshot.count || right >= snapshot.count { return 0 }
+CompareProcesses :: (left: *Process, right: *Process, column: s32) -> s32 {
     if column == COLUMN_NAME {
-        return CompareName(snapshot.processes[left].name[0:snapshot.processes[left].name_count],
-            snapshot.processes[right].name[0:snapshot.processes[right].name_count])
+        return CompareName(left.name[0:left.name_count], right.name[0:right.name_count])
     }
     if column == COLUMN_PID {
-        if snapshot.processes[left].pid < snapshot.processes[right].pid { return -1 }
-        if snapshot.processes[left].pid > snapshot.processes[right].pid { return 1 }
+        if left.pid < right.pid { return -1 }
+        if left.pid > right.pid { return 1 }
         return 0
     }
     if column == COLUMN_CPU {
-        if snapshot.processes[left].cpu_percent < snapshot.processes[right].cpu_percent { return -1 }
-        if snapshot.processes[left].cpu_percent > snapshot.processes[right].cpu_percent { return 1 }
+        if left.cpu_percent < right.cpu_percent { return -1 }
+        if left.cpu_percent > right.cpu_percent { return 1 }
         return 0
     }
     if column == COLUMN_CPU_TIME {
-        if snapshot.processes[left].ticks < snapshot.processes[right].ticks { return -1 }
-        if snapshot.processes[left].ticks > snapshot.processes[right].ticks { return 1 }
+        if left.ticks < right.ticks { return -1 }
+        if left.ticks > right.ticks { return 1 }
         return 0
     }
     if column == COLUMN_MEMORY {
-        if snapshot.processes[left].memory_bytes < snapshot.processes[right].memory_bytes { return -1 }
-        if snapshot.processes[left].memory_bytes > snapshot.processes[right].memory_bytes { return 1 }
+        if left.memory_bytes < right.memory_bytes { return -1 }
+        if left.memory_bytes > right.memory_bytes { return 1 }
         return 0
     }
     return 0
+}
+
+CompareRows :: (snapshot: *Snapshot, left: s32, right: s32, column: s32) -> s32 {
+    if left == right { return 0 }
+    if left < 0 || right < 0 || left >= snapshot.count || right >= snapshot.count { return 0 }
+    return CompareProcesses(*snapshot.processes[left], *snapshot.processes[right], column)
 }
 
 // Fills ORDER with a stable sort of the snapshot rows for COLUMN. Direction 1
@@ -763,6 +936,32 @@ SortOrder :: (snapshot: *Snapshot, order: []s32, column: s32, direction: s32) {
         position := slot - 1
         while position >= 0 {
             comparison := CompareRows(snapshot, order[position], key, column)
+            if direction < 0 { comparison = -comparison }
+            if comparison <= 0 { break }
+            order[position + 1] = order[position]
+            position -= 1
+        }
+        order[position + 1] = key
+    }
+}
+
+// Stable ordering for compact aggregate groups.
+#program_export
+SortGroupOrder :: (source: *Snapshot, grouped: *GroupedSnapshot, order: []s32,
+    column: s32, direction: s32) {
+    count := grouped.count
+    if count > cast(s32)order.count { count = cast(s32)order.count }
+    if count > 0 {
+        for index: 0..count - 1 { order[index] = index }
+    }
+    if column < 0 || column >= COLUMNS || direction == 0 || count < 2 { return }
+    for slot: 1..count - 1 {
+        key := order[slot]
+        key_process := GroupProcess(source, *grouped.groups[key])
+        position := slot - 1
+        while position >= 0 {
+            other := GroupProcess(source, *grouped.groups[order[position]])
+            comparison := CompareProcesses(*other, *key_process, column)
             if direction < 0 { comparison = -comparison }
             if comparison <= 0 { break }
             order[position + 1] = order[position]

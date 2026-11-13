@@ -1,0 +1,13 @@
+// Pure keyboard shortcut mapping shared by the UI and native tests. Kryon
+// reports printable digit keys as ASCII and Control as modifier bit 2.
+CONTROL_MODIFIER :: 2;
+
+#program_export
+TabForShortcut :: (key: s32, modifiers: s32) -> s32 {
+    if (modifiers & CONTROL_MODIFIER) == 0 { return -1 }
+    // Follow the visible tab order: Applications, Processes, Performance.
+    if key == 49 { return 0 }
+    if key == 50 { return 1 }
+    if key == 51 { return 2 }
+    return -1
+}

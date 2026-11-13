@@ -22,13 +22,16 @@ three-pane status bar.
   sends SIGTERM to one member; `End Group` sends it to every current member and
   reports any partial failure.
 - **Performance** shows 60-sample CPU, memory, GPU and VRAM histories as clean
-  green lines on black, plus process, thread, handle, physical-memory, commit
-  and kernel-memory totals. Memory values use explicit adaptive B, KB, MB, GB
-  or TB units. GPU counters come from standard Linux DRM sysfs and display
-  `n/a` when the driver does not expose them.
+  Windows-style colored lines on black, plus process, thread, handle,
+  physical-memory, commit and kernel-memory totals. Every detected DRM card
+  has a stable `cardN` label, distinct graph color and independent GPU/VRAM
+  reading; unsupported counters display `n/a`. Memory values use explicit
+  adaptive B, KB, MB, GB or TB units.
 - File, Options, View and Help menus provide Run, refresh speed, manual refresh,
   kernel-time display, process grouping, end-process confirmation and About
   actions.
+- Ctrl+1, Ctrl+2 and Ctrl+3 switch to Applications, Processes and Performance,
+  matching the visible tab order.
 
 The model refreshes once a second by default and reads `/proc` directly.
 `TASKMGR_TAB=applications|processes|performance` selects the initial tab, which

@@ -6,8 +6,10 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 app_binary=$root/build/taskmgr-desktop
 limit_kb=${TASKMGR_RSS_LIMIT_KB:-30720}
+duration_seconds=${TASKMGR_MEMORY_SECONDS:-30}
+display_attempt_limit=${TASKMGR_DISPLAY_ATTEMPTS:-100}
 
-for tool in Xvfb awk; do
+for tool in Xvfb xdpyinfo awk; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'memory-test: SKIPPED, %s is not installed\n' "$tool"
         exit 0
@@ -30,21 +32,19 @@ trap cleanup EXIT INT TERM
 start=$((120 + ($$ % 100)))
 number=
 attempt=0
-while [ "$attempt" -lt 10 ]; do
+while [ "$attempt" -lt "$display_attempt_limit" ]; do
     candidate=$((120 + ((start - 120 + attempt) % 100)))
-    env -i PATH="$PATH" HOME="$scratch" HARMONY_DESKTOP_RECOVERY=0 \
+    env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" HARMONY_DESKTOP_RECOVERY=0 \
         Xvfb ":$candidate" -screen 0 1024x720x24 -nolisten tcp -noreset \
         >"$scratch/xvfb.log" 2>&1 &
     candidate_pid=$!
     waited=0
     while kill -0 "$candidate_pid" 2>/dev/null && [ "$waited" -lt 40 ]; do
-        if [ -S "/tmp/.X11-unix/X$candidate" ]; then
-            sleep 0.1
-            if kill -0 "$candidate_pid" 2>/dev/null; then
-                number=$candidate
-                pids=$candidate_pid
-                break
-            fi
+        if env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" \
+            DISPLAY=":$candidate" xdpyinfo >/dev/null 2>&1; then
+            number=$candidate
+            pids=$candidate_pid
+            break
         fi
         waited=$((waited + 1))
         sleep 0.1
@@ -60,26 +60,40 @@ if [ -z "$number" ]; then
     exit 1
 fi
 
-env -i PATH="$PATH" HOME="$scratch" DISPLAY=":$number" \
+env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" DISPLAY=":$number" \
     HARMONY_DESKTOP_RECOVERY=0 \
     "$app_binary" >"$scratch/taskmgr.log" 2>&1 &
 app_pid=$!
 pids="$pids $app_pid"
-# Allow several process refreshes and both retained text generations to be
-# touched before measuring the steady native working set.
-sleep 5
-if ! kill -0 "$app_pid" 2>/dev/null; then
-    echo 'memory-test: taskmgr exited before measurement' >&2
-    sed -n '1,120p' "$scratch/taskmgr.log" >&2
+if [ "$duration_seconds" -lt 1 ]; then
+    echo 'memory-test: TASKMGR_MEMORY_SECONDS must be at least 1' >&2
     exit 1
 fi
 
-rss_kb=$(awk '$1 == "VmRSS:" { print $2 }' "/proc/$app_pid/status")
+# Sample for a sustained interval so delayed allocations and repeated process
+# refreshes cannot hide behind a single favorable reading.
+elapsed=0
+peak_kb=0
+rss_series=
+while [ "$elapsed" -lt "$duration_seconds" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if ! kill -0 "$app_pid" 2>/dev/null; then
+        echo 'memory-test: taskmgr exited before measurement completed' >&2
+        sed -n '1,120p' "$scratch/taskmgr.log" >&2
+        exit 1
+    fi
+    rss_kb=$(awk '$1 == "VmRSS:" { print $2 }' "/proc/$app_pid/status")
+    if [ -z "$rss_series" ]; then rss_series=$rss_kb; else rss_series="$rss_series $rss_kb"; fi
+    if [ "$rss_kb" -gt "$peak_kb" ]; then peak_kb=$rss_kb; fi
+done
+
 anon_kb=$(awk '$1 == "RssAnon:" { print $2 }' "/proc/$app_pid/status")
 file_kb=$(awk '$1 == "RssFile:" { print $2 }' "/proc/$app_pid/status")
 shmem_kb=$(awk '$1 == "RssShmem:" { print $2 }' "/proc/$app_pid/status")
-printf 'taskmgr RSS: %s KB (anonymous %s KB, file %s KB, shared %s KB)\n' \
-    "$rss_kb" "$anon_kb" "$file_kb" "$shmem_kb"
+printf 'taskmgr RSS series (1s..%ss): %s KB\n' "$duration_seconds" "$rss_series"
+printf 'taskmgr peak RSS: %s KB; final %s KB (anonymous %s KB, file %s KB, shared %s KB)\n' \
+    "$peak_kb" "$rss_kb" "$anon_kb" "$file_kb" "$shmem_kb"
 if [ "${TASKMGR_MEMORY_DETAILS:-0}" = 1 ]; then
     awk '
         /^[0-9a-f]+-[0-9a-f]+/ {
@@ -109,8 +123,8 @@ if [ "${TASKMGR_MEMORY_DETAILS:-0}" = 2 ]; then
         END { emit() }
     ' "/proc/$app_pid/smaps" | sort -nr | head -30
 fi
-if [ "$rss_kb" -ge "$limit_kb" ]; then
-    printf 'memory-test: RSS %s KB exceeds limit %s KB\n' "$rss_kb" "$limit_kb" >&2
+if [ "$peak_kb" -ge "$limit_kb" ]; then
+    printf 'memory-test: peak RSS %s KB exceeds limit %s KB\n' "$peak_kb" "$limit_kb" >&2
     exit 1
 fi
 echo 'taskmgr memory limit passed'

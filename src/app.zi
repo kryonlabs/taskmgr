@@ -8,6 +8,7 @@ SystemThemeHostLinux :: #import "kryon/SystemThemeHostLinux";
 Window :: #import "kryon/Window";
 Number :: #import "std/number_text";
 Timer :: #import "std/timer_linux";
+Shortcuts :: #import "app_shortcuts";
 #import "layout"
 
 // taskmgr: a Kryon task manager for Linux with the classic layout: a menu
@@ -188,6 +189,16 @@ PaletteLayer :: (opacity: u32) -> u32 {
     return Theme.StateLayer(palette_background, palette_text, opacity)
 }
 
+AppendText :: (output: []u8, start: s32, text: string) -> s32 {
+    length := start
+    for byte: text {
+        if length >= cast(s32)output.count { break }
+        output[length] = byte
+        length += 1
+    }
+    return length
+}
+
 Inset :: (bounds: Rectangle, amount: float32) -> Rectangle {
     width := bounds.width - amount * 2.0
     height := bounds.height - amount * 2.0
@@ -312,22 +323,22 @@ BuildDisplayRows :: () {
         }
         return
     }
-    Model.SortOrder(grouped, group_order[:], sort_column, sort_direction)
+    Model.SortGroupOrder(raw, grouped, group_order[:], sort_column, sort_direction)
     if grouped.count <= 0 { return }
     for position: 0..grouped.count - 1 {
         group_index := group_order[position]
-        group := *grouped.processes[group_index]
+        group := Model.GroupProcess(raw, *grouped.groups[group_index])
         if group.group_count <= 1 {
             process_index := Model.FindProcess(raw, group.pid)
             if process_index >= 0 { AppendDisplayRow(process_index, -1, false) }
             continue
         }
         AppendDisplayRow(-1, group_index, true)
-        if GroupExpanded(group) && raw.count > 0 {
+        if GroupExpanded(*group) && raw.count > 0 {
             for raw_position: 0..raw.count - 1 {
                 process_index := raw_order[raw_position]
                 entry := *raw.processes[process_index]
-                if Model.SameProcessGroup(group, entry) {
+                if Model.SameProcessGroup(*group, entry) {
                     AppendDisplayRow(process_index, group_index, false)
                 }
             }
@@ -345,7 +356,7 @@ RebuildOrder :: (store: *CellText) {
         row := display_rows[index]
         entry: Model.Process
         if row.group_header {
-            entry = grouped.processes[row.group_index]
+            entry = Model.GroupProcess(raw, *grouped.groups[row.group_index])
             if selected_is_group &&
                GroupNameMatches(selected_group_name[0:selected_group_name_count], *entry) {
                 selected_row = index
@@ -689,10 +700,12 @@ EndSelectedProcess :: () {
     }
 }
 
-FindNamedGroup :: (snapshot: *Model.Snapshot, name: []u8) -> s32 {
+FindNamedGroup :: (snapshot: *Model.GroupedSnapshot, name: []u8) -> s32 {
+    raw := Model.Current()
     if snapshot.count > 0 {
         for index: 0..snapshot.count - 1 {
-            if GroupNameMatches(name, *snapshot.processes[index]) { return index }
+            group := Model.GroupProcess(raw, *snapshot.groups[index])
+            if GroupNameMatches(name, *group) { return index }
         }
     }
     return -1
@@ -705,8 +718,9 @@ EndSelectedGroup :: () {
         SetStatusText("That process group has already exited.")
         return
     }
-    group := *grouped.processes[index]
-    result := Model.EndProcessGroup(Model.Current(), group)
+    raw := Model.Current()
+    group := Model.GroupProcess(raw, *grouped.groups[index])
+    result := Model.EndProcessGroup(raw, *group)
     sent_line: [16]u8
     failed_line: [16]u8
     name_line := TextView(end_group_name[0:end_group_name_count])
@@ -866,11 +880,11 @@ ProcessesTab :: (session: Session, area: Rectangle) {
     if selected_row >= 0 && selected_row < display_count {
         row := display_rows[selected_row]
         if row.group_header {
-            group := *grouped_snapshot.processes[row.group_index]
+            group := Model.GroupProcess(raw, *grouped_snapshot.groups[row.group_index])
             selected_is_group = true
-            selected_group_name_count = CopyGroupName(group, selected_group_name[:])
+            selected_group_name_count = CopyGroupName(*group, selected_group_name[:])
             if table.clicked_row == selected_row && group.group_count > 1 {
-                ToggleGroup(group)
+                ToggleGroup(*group)
                 pending_sort = true
             }
         } else {
@@ -900,7 +914,9 @@ ProcessesTab :: (session: Session, area: Rectangle) {
             group_index := FindNamedGroup(grouped_snapshot,
                 end_group_name[0:end_group_name_count])
             end_group_members = 0
-            if group_index >= 0 { end_group_members = grouped_snapshot.processes[group_index].group_count }
+            if group_index >= 0 {
+                end_group_members = grouped_snapshot.groups[group_index].group_count
+            }
         } else {
             end_pid = selected_pid
         }
@@ -908,38 +924,99 @@ ProcessesTab :: (session: Session, area: Rectangle) {
     }
 }
 
-HistoryGraph :: (session: Session, key: s32, bounds: Rectangle, label: string, kind: s32,
-    with_kernel: bool) {
-    // Classic Task Manager graph: a clean green trace on black, with no grid
-    // or endpoint marker. The surrounding fieldset carries the visible title.
-    Box(session, BoxProps.{.key = cast(u64)key, .bounds = bounds,
-        .fill = Color32(cast(u32)0x000000ff),
-        .border = Color32(cast(u32)0x008000ff), .radius = 0.0})
-    values: [Model.HISTORY_LENGTH]float32
-    series := Model.History(kind, values[:])
+GraphColor :: (kind: s32, series: s32) -> u32 {
+    // Windows' classic performance palette on black: CPU green, memory
+    // yellow, and stable per-adapter cyan/orange/violet/blue graphics traces.
+    if kind == Model.HISTORY_CPU { return cast(u32)0x00ff00ff }
+    if kind == Model.HISTORY_MEMORY { return cast(u32)0xffff00ff }
+    palette: [6]u32 = .{cast(u32)0x00ffffff, cast(u32)0xff9900ff,
+        cast(u32)0xcc66ffff, cast(u32)0x3399ffff,
+        cast(u32)0xff66ccff, cast(u32)0x99ff66ff}
+    return palette[series % 6]
+}
+
+DrawHistorySeries :: (session: Session, inner: Rectangle, series: []float32, color: u32) {
     count := cast(s32)series.count
     if count > 1 {
-        inner := Rectangle.{bounds.x + 2.0, bounds.y + 2.0,
-            bounds.width - 4.0, bounds.height - 4.0}
         for index: 1..count - 1 {
             x0 := inner.x + inner.width * cast(float32)(index - 1) / cast(float32)(count - 1)
             x1 := inner.x + inner.width * cast(float32)index / cast(float32)(count - 1)
             y0 := inner.y + inner.height * (1.0 - series[index - 1] / 100.0)
             y1 := inner.y + inner.height * (1.0 - series[index] / 100.0)
-            PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0},
-                Color32(cast(u32)0x00ff00ff))
+            PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0}, Color32(color))
         }
+    }
+}
+
+GpuLegend :: (device: *Model.GpuDevice, kind: s32, output: []u8) -> string {
+    card_digits: [16]u8
+    length: s32 = 0
+    length = AppendText(output, length, "card")
+    length = AppendText(output, length,
+        Number.FormatInteger(cast(s64)device.card_index, card_digits[:]))
+    length = AppendText(output, length, ": ")
+    if kind == Model.HISTORY_GPU {
+        if !device.busy_supported { length = AppendText(output, length, "n/a") }
+        else {
+            percent: [16]u8
+            length = AppendText(output, length, Model.FormatCpu(device.busy_percent, percent[:]))
+            length = AppendText(output, length, "%")
+        }
+    } else {
+        if !device.vram_supported { length = AppendText(output, length, "n/a") }
+        else {
+            used: [32]u8
+            total: [32]u8
+            length = AppendText(output, length, Model.FormatBytes(device.vram_used, used[:]))
+            length = AppendText(output, length, " / ")
+            length = AppendText(output, length, Model.FormatBytes(device.vram_total, total[:]))
+        }
+    }
+    return TextView(output[0:length])
+}
+
+HistoryGraph :: (session: Session, key: s32, bounds: Rectangle, label: string, kind: s32,
+    font: s32, with_kernel: bool) {
+    border := GraphColor(kind, 0)
+    Box(session, BoxProps.{.key = cast(u64)key, .bounds = bounds,
+        .fill = Color32(cast(u32)0x000000ff),
+        .border = Color32(border), .radius = 0.0})
+    inner := Rectangle.{bounds.x + 2.0, bounds.y + 2.0,
+        bounds.width - 4.0, bounds.height - 4.0}
+    if kind == Model.HISTORY_GPU || kind == Model.HISTORY_VRAM {
+        snapshot := Model.Current()
+        if snapshot.gpu_count > 0 {
+            for device_index: 0..snapshot.gpu_count - 1 {
+                device := *snapshot.gpus[device_index]
+                supported := device.busy_supported
+                if kind == Model.HISTORY_VRAM { supported = device.vram_supported }
+                color := GraphColor(kind, device_index)
+                if supported {
+                    values: [Model.HISTORY_LENGTH]float32
+                    series := Model.GpuHistory(kind, device.card_index, values[:])
+                    DrawHistorySeries(session, inner, series, color)
+                }
+                // A compact colored legend identifies every detected card,
+                // including adapters whose driver exposes no metric.
+                legend: [64]u8
+                row := Rectangle.{inner.x + 3.0,
+                    inner.y + 2.0 + cast(float32)device_index * 16.0,
+                    inner.width - 6.0, 15.0}
+                PaintLine(session, -1, .{row.x + 3.0, row.y + 7.0, 8.0, 0.0},
+                    Color32(color))
+                PaintClippedLabel(session, -1, GpuLegend(device, kind, legend[:]),
+                    cast(s32)(row.x + 15.0), cast(s32)row.y, font,
+                    Color32(color), inner)
+            }
+        }
+    } else {
+        values: [Model.HISTORY_LENGTH]float32
+        series := Model.History(kind, values[:])
+        DrawHistorySeries(session, inner, series, GraphColor(kind, 0))
         if with_kernel {
             kernel_values: [Model.HISTORY_LENGTH]float32
             kernel := Model.History(Model.HISTORY_KERNEL, kernel_values[:])
-            for index: 1..count - 1 {
-                x0 := inner.x + inner.width * cast(float32)(index - 1) / cast(float32)(count - 1)
-                x1 := inner.x + inner.width * cast(float32)index / cast(float32)(count - 1)
-                y0 := inner.y + inner.height * (1.0 - kernel[index - 1] / 100.0)
-                y1 := inner.y + inner.height * (1.0 - kernel[index] / 100.0)
-                PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0},
-                    Color32(cast(u32)0xff0000ff))
-            }
+            DrawHistorySeries(session, inner, kernel, cast(u32)0xff0000ff)
         }
     }
     unused label
@@ -965,7 +1042,7 @@ PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: strin
     reading_height: float32 = 18.0
     graph := Rectangle.{content.x, content.y, content.width, content.height - reading_height - 3.0}
     if graph.height < 20.0 { graph.height = 20.0 }
-    HistoryGraph(session, key + 1, graph, semantic_label, history_kind, with_kernel)
+    HistoryGraph(session, key + 1, graph, semantic_label, history_kind, font, with_kernel)
     CenteredLabel(session, key + 2, reading,
         .{content.x, graph.y + graph.height + 3.0, content.width, reading_height}, font)
 }
@@ -996,7 +1073,7 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         gpu_reading: string = "n/a"
         gpu_digits: [16]u8
         gpu_text: [24]u8
-        if snapshot.gpu_count > 0 {
+        if snapshot.gpu_supported_count > 0 {
             gpu_parts: [2]string = .{Model.FormatCpu(snapshot.gpu_percent, gpu_digits[:]), "%"}
             gpu_reading = JoinAll(gpu_parts[:], gpu_text[:])
         }
@@ -1202,5 +1279,12 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
     if dialog == DIALOG_RUN { RunDialog(session, font) }
     if dialog == DIALOG_ABOUT { AboutDialog(session) }
     if dialog == DIALOG_END_PROCESS { EndProcessDialog(session) }
+    // Menus and dialogs get first chance to consume the key. With no modal
+    // active, Ctrl+1/2/3 follows the visible tab order.
+    if dialog == DIALOG_NONE {
+        shortcut_tab := Shortcuts.TabForShortcut(KeyboardTake(session),
+            KeyboardModifiers(session))
+        if shortcut_tab >= 0 { current_tab = shortcut_tab }
+    }
     return 0
 }
