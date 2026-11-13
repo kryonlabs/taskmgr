@@ -1,0 +1,99 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: taskmgr-release
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux build, test and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out taskmgr
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read locked Ziran toolchain
+        id: toolchain
+        run: |
+          set -eu
+          commit=$(awk '/"toolchain"/ { found = 1 } found && /"commit"/ { gsub(/[",]/, "", $2); print $2; exit }' ziran.lock)
+          test "${#commit}" -eq 40
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out locked Ziran
+        uses: actions/checkout@v4
+        with:
+          repository: ziranlang/ziran
+          ref: ${{ steps.toolchain.outputs.commit }}
+          path: ziran
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libsdl2-dev libgl1-mesa-dev libx11-dev \
+            libcairo2-dev libpango1.0-dev libfontconfig1-dev libfreetype6-dev \
+            xvfb xfwm4 xterm x11-utils
+
+      - name: Build locked Ziran
+        working-directory: ziran
+        run: make -j2 JOBS=2 all
+
+      - name: Build and test taskmgr
+        run: |
+          printf '[overrides]\nziran = "%s/ziran"\n' "$GITHUB_WORKSPACE" > ziran.local.toml
+          env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY \
+            -u DBUS_SESSION_BUS_ADDRESS -u SESSION_MANAGER \
+            HARMONY_DESKTOP_RECOVERY=0 make check test x11-test
+
+      - name: Package Linux binary
+        id: package
+        run: |
+          set -eu
+          version=$(cat VERSION)
+          tag="v$version"
+          package="taskmgr-linux-x86_64-$tag"
+          mkdir -p "dist/$package/bin"
+          cp build/taskmgr-desktop "dist/$package/bin/taskmgr"
+          cp README.md CHANGELOG.md "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          sha256sum "dist/$package.tar.gz" > dist/SHA256SUMS
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "asset=dist/$package.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish new version
+        if: steps.package.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          set -eu
+          notes=$(awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {found=1; next} found && /^## / {exit} found' CHANGELOG.md)
+          test -n "$notes"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Task Manager $VERSION"
+          git push origin "$TAG"
+          gh release create "$TAG" "$ASSET" dist/SHA256SUMS \
+            --title "Task Manager $VERSION" --notes "$notes"

@@ -1,4 +1,5 @@
 using Model :: #import "model";
+Files :: #import "std/file";
 
 test_libc :: #system_library "libc";
 TestFork :: () -> s32 #foreign test_libc "fork";
@@ -6,6 +7,8 @@ TestPause :: () -> s32 #foreign test_libc "pause";
 TestExit :: (status: s32) -> void #foreign test_libc "_exit";
 TestKill :: (pid: s32, signal: s32) -> s32 #foreign test_libc "kill";
 TestWait :: (pid: s32, status: *s32, options: s32) -> s32 #foreign test_libc "waitpid";
+TestSleep :: (micros: u32) -> s32 #foreign test_libc "usleep";
+TestUnlink :: (path: *u8) -> s32 #foreign test_libc "unlink";
 
 BytesOf :: (text: string, output: []u8) -> []u8 {
     count: s32 = 0
@@ -37,8 +40,44 @@ ParserTest :: () -> bool {
     }
     if TextView(process.name[0:process.name_count]) != "worker (stage) name" ||
        process.state != Model.STATE_SLEEPING || process.ticks != 23 ||
-       process.memory_bytes == 0 {
+       process.memory_bytes == 0 || process.threads != 17 {
         print("parse: process stat fields wrong\n")
+        return false
+    }
+    if Model.CpuKernelTicks(BytesOf(cpu, cpu_bytes[:])) != 43 {
+        print("parse: kernel cpu ticks wrong\n")
+        return false
+    }
+    short := "cpu  1 2 3\n"
+    short_bytes: [32]u8
+    if Model.CpuKernelTicks(BytesOf(short, short_bytes[:])) != 0 {
+        print("parse: short cpu line accepted\n")
+        return false
+    }
+
+    meminfo := "MemTotal:       32000000 kB\nMemFree:  1000 kB\nMemAvailable:   12000000 kB\nBuffers:  500 kB\nCached:   7000 kB\nSwapCached:  99 kB\nSwapTotal: 4000 kB\nSwapFree: 3000 kB\nSReclaimable: 800 kB\nSUnreclaim: 200 kB\nCommitLimit: 20000000 kB\nCommitted_AS: 15000000 kB\n"
+    meminfo_bytes: [512]u8
+    memory := Model.ParseMemory(BytesOf(meminfo, meminfo_bytes[:]))
+    if memory.total_kb != 32000000 || memory.available_kb != 12000000 ||
+       memory.cache_kb != 7500 || memory.commit_kb != 15000000 ||
+       memory.commit_limit_kb != 20000000 || memory.kernel_paged_kb != 800 ||
+       memory.kernel_nonpaged_kb != 200 || memory.swap_total_kb != 4000 ||
+       memory.swap_free_kb != 3000 {
+        print("parse: meminfo fields wrong\n")
+        return false
+    }
+    missing := "MemTotal: 10 kB\nSwapCached: 5 kB\n"
+    missing_bytes: [64]u8
+    partial := Model.ParseMemory(BytesOf(missing, missing_bytes[:]))
+    if partial.cache_kb != -1 || partial.commit_kb != -1 {
+        print("parse: absent meminfo entries not reported as missing\n")
+        return false
+    }
+
+    file_nr := "2848\t0\t9223372036854775807\n"
+    file_nr_bytes: [64]u8
+    if Model.FirstNumber(BytesOf(file_nr, file_nr_bytes[:])) != 2848 {
+        print("parse: file handle count wrong\n")
         return false
     }
     return true
@@ -60,6 +99,15 @@ ScanTest :: () -> bool {
         print("scan: total cpu percent out of range\n")
         return false
     }
+    if snapshot.gpu_count > 0 &&
+       (snapshot.gpu_percent < 0.0 || snapshot.gpu_percent > 100.0) {
+        print("scan: GPU percent out of range\n")
+        return false
+    }
+    if snapshot.vram_total > 0 && snapshot.vram_used > snapshot.vram_total {
+        print("scan: VRAM usage exceeds total\n")
+        return false
+    }
     mine := Model.CurrentProcessId()
     index := Model.FindProcess(snapshot, mine)
     if index < 0 {
@@ -67,6 +115,18 @@ ScanTest :: () -> bool {
         return false
     }
     entry := snapshot.processes[index]
+    if entry.threads < 1 {
+        print("scan: own process thread count missing\n")
+        return false
+    }
+    if snapshot.threads < cast(s64)snapshot.count {
+        print("scan: thread total below process count\n")
+        return false
+    }
+    if snapshot.memory.total_kb <= 0 || snapshot.memory.commit_kb < 0 {
+        print("scan: meminfo details missing\n")
+        return false
+    }
     if entry.name_count <= 0 {
         print("scan: own process name empty\n")
         return false
@@ -77,6 +137,45 @@ ScanTest :: () -> bool {
     }
     if entry.state == 0 {
         print("scan: own process state missing\n")
+        return false
+    }
+    return true
+}
+
+SetProcessName :: (process: *Model.Process, name: string) {
+    process.name_count = cast(s32)name.count
+    for index: 0..process.name_count - 1 { process.name[index] = name[index] }
+}
+
+GroupingTest :: () -> bool {
+    source: Model.Snapshot
+    grouped: Model.Snapshot
+    source.count = 4
+    SetProcessName(*source.processes[0], "codex")
+    SetProcessName(*source.processes[1], "codex-linux-x64")
+    SetProcessName(*source.processes[2], "Bash")
+    SetProcessName(*source.processes[3], "bash")
+    source.processes[0].pid = 10; source.processes[0].cpu_percent = 1.5
+    source.processes[0].memory_bytes = 100; source.processes[0].ticks = 20
+    source.processes[1].pid = 11; source.processes[1].cpu_percent = 2.5
+    source.processes[1].memory_bytes = 200; source.processes[1].ticks = 30
+    source.processes[2].pid = 20; source.processes[2].memory_bytes = 300
+    source.processes[3].pid = 21; source.processes[3].memory_bytes = 400
+    Model.BuildGroupedSnapshot(*source, *grouped)
+    if grouped.count != 2 {
+        print("grouping: expected two image-name groups\n")
+        return false
+    }
+    codex := grouped.processes[0]
+    if TextView(codex.name[0:codex.name_count]) != "codex" ||
+       codex.group_count != 2 || codex.memory_bytes != 300 ||
+       codex.ticks != 50 || codex.cpu_percent != 4.0 {
+        print("grouping: Codex family did not aggregate under codex\n")
+        return false
+    }
+    shell := grouped.processes[1]
+    if shell.group_count != 2 || shell.memory_bytes != 700 {
+        print("grouping: case-insensitive image group is wrong\n")
         return false
     }
     return true
@@ -116,7 +215,7 @@ SortTest :: () -> bool {
         print("sort: cpu descending wrong\n")
         return false
     }
-    Model.SortOrder(*data, order[:], 3, -1)
+    Model.SortOrder(*data, order[:], Model.COLUMN_MEMORY, -1)
     if order[0] != 0 || order[1] != 2 || order[2] != 1 {
         print("sort: memory descending wrong\n")
         return false
@@ -126,15 +225,15 @@ SortTest :: () -> bool {
         print("sort: name ascending wrong\n")
         return false
     }
-    data.processes[0].state = Model.STATE_RUNNING
-    data.processes[1].state = Model.STATE_SLEEPING
-    data.processes[2].state = Model.STATE_WAITING
-    Model.SortOrder(*data, order[:], 4, 1)
+    data.processes[0].ticks = 500
+    data.processes[1].ticks = 900
+    data.processes[2].ticks = 100
+    Model.SortOrder(*data, order[:], Model.COLUMN_CPU_TIME, 1)
     if order[0] != 2 || order[1] != 0 || order[2] != 1 {
-        print("sort: state ascending wrong\n")
+        print("sort: cpu time ascending wrong\n")
         return false
     }
-    Model.SortOrder(*data, order[:], 4, 0)
+    Model.SortOrder(*data, order[:], Model.COLUMN_MEMORY, 0)
     if order[0] != 0 || order[1] != 1 || order[2] != 2 {
         print("sort: natural order wrong\n")
         return false
@@ -158,6 +257,115 @@ FormatTest :: () -> bool {
     }
     if Model.StateName(Model.STATE_RUNNING) != "Running" {
         print("format: running state wrong\n")
+        return false
+    }
+    if Model.FormatThousands(1234567, buffer[:]) != "1,234,567" ||
+       Model.FormatThousands(999, buffer[:]) != "999" ||
+       Model.FormatThousands(1000, buffer[:]) != "1,000" ||
+       Model.FormatThousands(0, buffer[:]) != "0" ||
+       Model.FormatThousands(-1, buffer[:]) != "n/a" {
+        print("format: thousands separators wrong\n")
+        return false
+    }
+    if Model.FormatKilobytes(cast(u64)12345 * 1024, buffer[:]) != "12,345 K" {
+        print("format: mem usage column wrong\n")
+        return false
+    }
+    if Model.FormatCpu(7.4, buffer[:]) != "07" || Model.FormatCpu(42.6, buffer[:]) != "43" ||
+       Model.FormatCpu(0.0, buffer[:]) != "00" || Model.FormatCpu(100.0, buffer[:]) != "100" {
+        print("format: cpu column wrong\n")
+        return false
+    }
+    ticks := cast(u64)(3725.0 * Model.ClockTicks())
+    if Model.FormatCpuTime(ticks, buffer[:]) != "1:02:05" ||
+       Model.FormatCpuTime(0, buffer[:]) != "0:00:00" {
+        print("format: cpu time wrong\n")
+        return false
+    }
+    return true
+}
+
+HistoryTest :: () -> bool {
+    Model.PushHistory(10.0, 2.0, 40.0)
+    Model.PushHistory(150.0, -5.0, 41.5)
+    Model.PushHistory(30.0, 3.0, 42.0)
+    values: [Model.HISTORY_LENGTH]float32
+    cpu := Model.History(Model.HISTORY_CPU, values[:])
+    last := Model.HISTORY_LENGTH - 1
+    if cast(s32)cpu.count != Model.HISTORY_LENGTH || cpu[last] != 30.0 ||
+       cpu[last - 1] != 100.0 || cpu[last - 2] != 10.0 {
+        print("history: cpu samples wrong or unclamped\n")
+        return false
+    }
+    kernel := Model.History(Model.HISTORY_KERNEL, values[:])
+    if kernel[last] != 3.0 || kernel[last - 1] != 0.0 {
+        print("history: kernel samples wrong\n")
+        return false
+    }
+    memory := Model.History(Model.HISTORY_MEMORY, values[:])
+    if memory[last] != 42.0 || memory[last - 1] != 41.5 {
+        print("history: memory samples wrong\n")
+        return false
+    }
+    Model.PushHistoryExtended(11.0, 4.0, 43.0, 67.0, 81.0)
+    gpu := Model.History(Model.HISTORY_GPU, values[:])
+    if gpu[last] != 67.0 {
+        print("history: GPU sample wrong\n")
+        return false
+    }
+    vram := Model.History(Model.HISTORY_VRAM, values[:])
+    if vram[last] != 81.0 {
+        print("history: VRAM sample wrong\n")
+        return false
+    }
+    // More samples than the ring holds keep only the newest, in order.
+    for step: 0..Model.HISTORY_LENGTH + 4 {
+        Model.PushHistory(cast(float64)(step % 100), 0.0, 0.0)
+    }
+    wrapped := Model.History(Model.HISTORY_CPU, values[:])
+    newest := cast(float32)((Model.HISTORY_LENGTH + 4) % 100)
+    if wrapped[last] != newest || wrapped[0] != newest - cast(float32)(Model.HISTORY_LENGTH - 1) {
+        print("history: wrapped samples out of order\n")
+        return false
+    }
+    short: [4]float32
+    if Model.History(Model.HISTORY_CPU, short[:]).count != 4 {
+        print("history: short output not respected\n")
+        return false
+    }
+    return true
+}
+
+StartTaskTest :: () -> bool {
+    if Model.StartTask("") || Model.StartTask("   ") {
+        print("start: empty command accepted\n")
+        return false
+    }
+    path := "build/start-task-probe"
+    path_bytes: [64]u8
+    count: s32 = 0
+    for byte: path { path_bytes[count] = byte; count += 1 }
+    path_bytes[count] = 0
+    unused TestUnlink(*path_bytes[0])
+    if !Model.StartTask("printf started > build/start-task-probe") {
+        print("start: shell did not start\n")
+        return false
+    }
+    found := false
+    waited: s32 = 0
+    while waited < 50 && !found {
+        file := Files.OpenRead(path)
+        if file.valid {
+            Files.CloseFile(file)
+            found = true
+        } else {
+            unused TestSleep(100000)
+            waited += 1
+        }
+    }
+    unused TestUnlink(*path_bytes[0])
+    if !found {
+        print("start: background command never ran\n")
         return false
     }
     return true
@@ -208,9 +416,12 @@ main :: (argc: s32, argv: **u8) -> s32 {
     }
     if !ParserTest() { print("parser fixture test failed\n"); return 65 }
     if !ScanTest() { print("scan/snapshot test failed\n"); return 66 }
+    if !GroupingTest() { print("process grouping test failed\n"); return 72 }
     if !SortTest() { print("sort test failed\n"); return 67 }
     if !FormatTest() { print("format test failed\n"); return 68 }
     if !SignalTest() { print("signal binding test failed\n"); return 69 }
+    if !HistoryTest() { print("history test failed\n"); return 70 }
+    if !StartTaskTest() { print("start task test failed\n"); return 71 }
     print("taskmgr model tests passed\n")
     return 0
 }

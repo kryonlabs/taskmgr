@@ -1,0 +1,316 @@
+// Top-level application windows for the Applications tab, read from the X11
+// window manager's _NET_CLIENT_LIST (EWMH), with the requests the tab sends
+// back: _NET_ACTIVE_WINDOW to switch to a window and _NET_CLOSE_WINDOW to ask
+// it to close. libX11 is loaded with dlopen on first use, so taskmgr runs
+// without X11; the list is then simply unavailable.
+
+MAX_WINDOWS :: 256;
+TITLE_CAPACITY :: 128;
+
+AppWindow :: struct {
+    id: u64
+    pid: s32
+    title_count: s32
+    title: [TITLE_CAPACITY]u8
+}
+
+AppList :: struct {
+    windows: [MAX_WINDOWS]AppWindow
+    count: s32
+    // An X11 display and a window manager's client list were reached.
+    available: bool
+}
+
+#scope_file
+
+c :: #system_library "c";
+dl :: #system_library "dl";
+
+DlOpen :: (path: *u8, flags: s32) -> *void #foreign dl "dlopen";
+DlSymbol :: (handle: *void, name: *u8) -> *void #foreign dl "dlsym";
+MemoryCopy :: (target: *void, source: *void, bytes: usize) -> *void #foreign c "memcpy";
+
+XErrorHandler :: #type (display: *void, event: *void) -> s32 #c_call;
+FnOpenDisplay :: #type (*u8) -> *void #c_call;
+FnRootWindow :: #type (*void) -> u64 #c_call;
+FnInternAtom :: #type (*void, *u8, s32) -> u64 #c_call;
+FnGetWindowProperty :: #type (*void, u64, u64, s64, s64, s32, u64, *u64,
+    *s32, *u64, *u64, **u8) -> s32 #c_call;
+FnSendEvent :: #type (*void, u64, s32, s64, *void) -> s32 #c_call;
+FnSync :: #type (*void, s32) -> s32 #c_call;
+FnFlush :: #type (*void) -> s32 #c_call;
+FnFree :: #type (*void) -> s32 #c_call;
+// XSetErrorHandler takes and returns handler addresses, kept here as raw
+// pointers so the previous handler can be put back unchanged.
+FnSetErrorHandler :: #type (*void) -> *void #c_call;
+
+x_open_display: FnOpenDisplay;
+x_default_root_window: FnRootWindow;
+x_intern_atom: FnInternAtom;
+x_get_window_property: FnGetWindowProperty;
+x_send_event: FnSendEvent;
+x_sync: FnSync;
+x_flush: FnFlush;
+x_free: FnFree;
+x_set_error_handler: FnSetErrorHandler;
+
+ignore_handler: XErrorHandler;
+ignore_address: *void;
+
+library_tried: bool;
+library_ready: bool;
+display: *void;
+root: u64;
+
+client_list_atom: u64;
+net_name_atom: u64;
+utf8_atom: u64;
+name_atom: u64;
+pid_atom: u64;
+state_atom: u64;
+skip_taskbar_atom: u64;
+type_atom: u64;
+type_normal_atom: u64;
+type_dialog_atom: u64;
+active_atom: u64;
+close_atom: u64;
+
+// Xlib event and mask values.
+CLIENT_MESSAGE :: 33;
+SUBSTRUCTURE_EVENTS :: 1572864; // SubstructureNotifyMask | SubstructureRedirectMask
+ANY_PROPERTY_TYPE :: 0;
+ATOM_TYPE :: 4;
+CARDINAL_TYPE :: 6;
+// EWMH source indication: a pager or task list, which window managers honor.
+SOURCE_PAGER :: 2;
+
+// Ignores X errors while windows are queried: a window can close between
+// reading the client list and reading its properties.
+IgnoreXError :: (display: *void, event: *void) -> s32 { return 0 }
+
+CopyCString :: (text: string, output: []u8) -> bool {
+    if cast(s32)text.count >= cast(s32)output.count { return false }
+    index: s32 = 0
+    for byte: text {
+        if byte == 0 { return false }
+        output[index] = byte
+        index += 1
+    }
+    output[index] = 0
+    return true
+}
+
+Resolve :: (handle: *void, slot: *void, name: string) -> bool {
+    bytes: [64]u8
+    if !CopyCString(name, bytes[:]) { return false }
+    symbol: *void = DlSymbol(handle, *bytes[0])
+    if symbol == null { return false }
+    MemoryCopy(slot, cast(*void)*symbol, size_of(*void))
+    return true
+}
+
+Atom :: (name: string) -> u64 {
+    bytes: [64]u8
+    if !CopyCString(name, bytes[:]) { return 0 }
+    return x_intern_atom(display, *bytes[0], 0)
+}
+
+Connect :: () -> bool {
+    if display != null { return true }
+    if library_tried { return false }
+    library_tried = true
+    name: [32]u8
+    if !CopyCString("libX11.so.6", name[:]) { return false }
+    // RTLD_LAZY | RTLD_LOCAL
+    handle: *void = DlOpen(*name[0], 1)
+    if handle == null { return false }
+    ok: bool = Resolve(handle, cast(*void)*x_open_display, "XOpenDisplay")
+    ok = ok && Resolve(handle, cast(*void)*x_default_root_window, "XDefaultRootWindow")
+    ok = ok && Resolve(handle, cast(*void)*x_intern_atom, "XInternAtom")
+    ok = ok && Resolve(handle, cast(*void)*x_get_window_property, "XGetWindowProperty")
+    ok = ok && Resolve(handle, cast(*void)*x_send_event, "XSendEvent")
+    ok = ok && Resolve(handle, cast(*void)*x_sync, "XSync")
+    ok = ok && Resolve(handle, cast(*void)*x_flush, "XFlush")
+    ok = ok && Resolve(handle, cast(*void)*x_free, "XFree")
+    ok = ok && Resolve(handle, cast(*void)*x_set_error_handler, "XSetErrorHandler")
+    if !ok { return false }
+    ignore_handler = IgnoreXError
+    MemoryCopy(cast(*void)*ignore_address, cast(*void)*ignore_handler, size_of(*void))
+    library_ready = true
+    display = x_open_display(null)
+    if display == null { return false }
+    root = x_default_root_window(display)
+    client_list_atom = Atom("_NET_CLIENT_LIST")
+    net_name_atom = Atom("_NET_WM_NAME")
+    utf8_atom = Atom("UTF8_STRING")
+    name_atom = Atom("WM_NAME")
+    pid_atom = Atom("_NET_WM_PID")
+    state_atom = Atom("_NET_WM_STATE")
+    skip_taskbar_atom = Atom("_NET_WM_STATE_SKIP_TASKBAR")
+    type_atom = Atom("_NET_WM_WINDOW_TYPE")
+    type_normal_atom = Atom("_NET_WM_WINDOW_TYPE_NORMAL")
+    type_dialog_atom = Atom("_NET_WM_WINDOW_TYPE_DIALOG")
+    active_atom = Atom("_NET_ACTIVE_WINDOW")
+    close_atom = Atom("_NET_CLOSE_WINDOW")
+    return true
+}
+
+// Reads up to output.count format-32 values (C longs) of a property.
+ReadLongs :: (window: u64, property: u64, wanted: u64, output: []u64) -> s32 {
+    actual: u64
+    format: s32
+    items: u64
+    after: u64
+    data: *u8
+    if x_get_window_property(display, window, property, 0, cast(s64)output.count, 0,
+        wanted, *actual, *format, *items, *after, *data) != 0 {
+        return 0
+    }
+    count: s32 = 0
+    if data != null && format == 32 {
+        values := cast(*u64)data
+        while cast(u64)count < items && count < cast(s32)output.count {
+            output[count] = values[count]
+            count += 1
+        }
+    }
+    if data != null { unused x_free(cast(*void)data) }
+    return count
+}
+
+// Reads a text property into the window's title; false when it is absent.
+ReadTitle :: (window: u64, property: u64, wanted: u64, entry: *AppWindow) -> bool {
+    actual: u64
+    format: s32
+    items: u64
+    after: u64
+    data: *u8
+    // The length is in 32-bit units: room for the whole title buffer.
+    if x_get_window_property(display, window, property, 0, TITLE_CAPACITY / 4 + 1, 0,
+        wanted, *actual, *format, *items, *after, *data) != 0 {
+        return false
+    }
+    found := false
+    if data != null && format == 8 && items > 0 {
+        length: s32 = 0
+        while cast(u64)length < items && length < TITLE_CAPACITY {
+            byte := data[length]
+            if byte == 0 { break }
+            // Control characters such as newlines would break the row.
+            if byte < 32 { byte = 32 }
+            entry.title[length] = byte
+            length += 1
+        }
+        // Never cut a UTF-8 sequence in half.
+        if cast(u64)length < items && length > 0 {
+            while length > 0 && (data[length] & 192) == 128 { length -= 1 }
+        }
+        entry.title_count = length
+        found = length > 0
+    }
+    if data != null { unused x_free(cast(*void)data) }
+    return found
+}
+
+// Whether a client window belongs in a task list: it is a normal window or a
+// dialog, and it has not asked to be left off the taskbar.
+Listed :: (window: u64) -> bool {
+    states: [32]u64
+    state_count := ReadLongs(window, state_atom, ATOM_TYPE, states[:])
+    if state_count > 0 {
+        for index: 0..state_count - 1 {
+            if states[index] == skip_taskbar_atom { return false }
+        }
+    }
+    types: [8]u64
+    type_count := ReadLongs(window, type_atom, ATOM_TYPE, types[:])
+    if type_count == 0 { return true }
+    return types[0] == type_normal_atom || types[0] == type_dialog_atom
+}
+
+SendClientMessage :: (window: u64, message: u64, first: s64, second: s64) -> bool {
+    if !Connect() || window == 0 { return false }
+    // XClientMessageEvent in a 192-byte XEvent: type, serial, send_event,
+    // display, window, message_type, format, then five longs of data.
+    event: [24]s64
+    event[0] = CLIENT_MESSAGE
+    event[2] = 1
+    event[4] = cast(s64)window
+    event[5] = cast(s64)message
+    event[6] = 32
+    event[7] = first
+    event[8] = second
+    previous := x_set_error_handler(ignore_address)
+    sent := x_send_event(display, root, 0, SUBSTRUCTURE_EVENTS, cast(*void)*event[0]) != 0
+    unused x_sync(display, 0)
+    unused x_set_error_handler(previous)
+    return sent
+}
+
+// Whether the root window carries _NET_CLIENT_LIST at all, even empty.
+HasClientList :: () -> bool {
+    actual: u64
+    format: s32
+    items: u64
+    after: u64
+    data: *u8
+    status := x_get_window_property(display, root, client_list_atom, 0, 0, 0,
+        ANY_PROPERTY_TYPE, *actual, *format, *items, *after, *data)
+    if data != null { unused x_free(cast(*void)data) }
+    return status == 0 && actual != 0
+}
+
+#scope_export
+
+// Fills LIST with the window manager's task windows in its stacking-agnostic
+// client order. LIST.available is false without X11 or an EWMH window manager.
+#program_export
+AppsRefresh :: (list: *AppList) {
+    list.count = 0
+    list.available = false
+    if !Connect() { return }
+    previous := x_set_error_handler(ignore_address)
+    // Without a window manager that publishes the client list there is no
+    // task list to show, which differs from an empty one.
+    list.available = HasClientList()
+    clients: [MAX_WINDOWS]u64
+    client_count: s32 = 0
+    if list.available {
+        client_count = ReadLongs(root, client_list_atom, ANY_PROPERTY_TYPE, clients[:])
+    }
+    if client_count > 0 {
+        for index: 0..client_count - 1 {
+            window := clients[index]
+            if !Listed(window) { continue }
+            entry := *list.windows[list.count]
+            entry.id = window
+            entry.title_count = 0
+            if !ReadTitle(window, net_name_atom, utf8_atom, entry) &&
+               !ReadTitle(window, name_atom, ANY_PROPERTY_TYPE, entry) {
+                continue
+            }
+            pid: [1]u64
+            entry.pid = 0
+            if ReadLongs(window, pid_atom, CARDINAL_TYPE, pid[:]) == 1 {
+                entry.pid = cast(s32)(pid[0] & cast(u64)0x7fffffff)
+            }
+            list.count += 1
+            if list.count >= MAX_WINDOWS { break }
+        }
+    }
+    unused x_sync(display, 0)
+    unused x_set_error_handler(previous)
+}
+
+// Asks the window manager to raise and focus WINDOW.
+#program_export
+AppsSwitchTo :: (window: u64) -> bool {
+    return SendClientMessage(window, active_atom, SOURCE_PAGER, 0)
+}
+
+// Asks the window manager to close WINDOW, as its own close button would; the
+// application may still ask to save its work first.
+#program_export
+AppsCloseWindow :: (window: u64) -> bool {
+    return SendClientMessage(window, close_atom, 0, SOURCE_PAGER)
+}

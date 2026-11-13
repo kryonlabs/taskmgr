@@ -1,28 +1,76 @@
 using UI :: #import "Widgets";
 using Model :: #import "model";
+Apps :: #import "windows";
 Tables :: #import "data_views/TableView";
+Theme :: #import "kryon/Theme";
+SystemTheme :: #import "kryon/SystemTheme";
+SystemThemeLinux :: #import "kryon/SystemThemeLinux";
+Window :: #import "kryon/Window";
 Number :: #import "std/number_text";
 Timer :: #import "std/timer_linux";
 #import "layout"
 
-// taskmgr: a Kryon process monitor for Linux. Frame runs every frame and
-// declares the whole interface from the model's current /proc snapshot; the
-// table sorts by clicking its headers and the model refreshes once a second.
+// taskmgr: a Kryon task manager for Linux with the classic layout: a menu
+// bar, Applications / Processes / Performance tabs and a status bar. Frame
+// runs every frame and declares the whole interface from the model's current
+// /proc snapshot and the window manager's task list. Colors come from the
+// active Kryon theme after installing the desktop's GTK palette at startup.
 //
 //   kryon run          the desktop window
 //   kryon run shot     one rendered frame without a display
+//
+// TASKMGR_TAB=applications|processes|performance picks the starting tab.
 
-COLUMNS :: 5;
-REFRESH_INTERVAL_MS :: 1000;
+libc :: #system_library "libc";
+Environment :: (name: *u8) -> *u8 #foreign libc "getenv";
+
+TAB_APPLICATIONS :: 0;
+TAB_PROCESSES :: 1;
+TAB_PERFORMANCE :: 2;
+
+MENU_NEW_TASK :: 10;
+MENU_EXIT :: 11;
+MENU_CONFIRM_END :: 12;
+MENU_GROUP_PROCESSES :: 13;
+MENU_REFRESH :: 20;
+MENU_SPEED_HIGH :: 21;
+MENU_SPEED_NORMAL :: 22;
+MENU_SPEED_LOW :: 23;
+MENU_SPEED_PAUSED :: 24;
+MENU_KERNEL_TIMES :: 25;
+MENU_ABOUT :: 30;
+
+DIALOG_NONE :: 0;
+DIALOG_RUN :: 1;
+DIALOG_ABOUT :: 2;
+DIALOG_END_PROCESS :: 3;
+
+// Update speeds in milliseconds; zero pauses automatic updates.
+SPEED_HIGH_MS :: 500;
+SPEED_NORMAL_MS :: 1000;
+SPEED_LOW_MS :: 4000;
 REFRESH_FALLBACK_FRAMES :: 60;
+
+MENU_HEIGHT :: 30.0;
+TAB_HEIGHT :: 34.0;
+STATUS_HEIGHT :: 26.0;
+BUTTON_HEIGHT :: 32.0;
+BUTTON_WIDTH :: 120.0;
+PAD :: 10.0;
+
+COLUMNS :: Model.COLUMNS;
+APP_COLUMNS :: 2;
 CELL_WIDTH :: 24;
 NAME_WIDTH :: 64;
-STATUS_WIDTH :: 128;
+STATUS_WIDTH :: 160;
 
-table_columns: [5]string = .{"Name", "PID", "CPU %", "Memory", "State"};
-column_fractions: [5]float32 = .{0.40, 0.10, 0.12, 0.22, 0.16};
-column_widths: [COLUMNS]s32;
-widths_ready: bool;
+process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Mem Usage"};
+process_fractions: [5]float32 = .{0.40, 0.12, 0.10, 0.16, 0.22};
+process_widths: [COLUMNS]s32;
+app_columns: [2]string = .{"Task", "Status"};
+app_fractions: [2]float32 = .{0.76, 0.24};
+app_widths: [APP_COLUMNS]s32;
+widths_for: float32;
 
 order: [Model.MAX_PROCESSES]s32;
 
@@ -34,6 +82,7 @@ CellText :: struct {
     name: [Model.MAX_PROCESSES * NAME_WIDTH]u8
     pid: [Model.MAX_PROCESSES * CELL_WIDTH]u8
     cpu: [Model.MAX_PROCESSES * CELL_WIDTH]u8
+    time: [Model.MAX_PROCESSES * CELL_WIDTH]u8
     mem: [Model.MAX_PROCESSES * CELL_WIDTH]u8
 }
 
@@ -41,22 +90,69 @@ text_stores_a: CellText;
 text_stores_b: CellText;
 text_active: s32;
 
-sort_column: s32 = 2;
+// Window manager task lists, also in two generations.
+AppText :: struct {
+    list: Apps.AppList
+    cell: [Apps.MAX_WINDOWS * APP_COLUMNS]string
+}
+
+app_stores_a: AppText;
+app_stores_b: AppText;
+app_active: s32;
+
+current_tab: s32 = TAB_PROCESSES;
+started: bool;
+menu_state: MenuState;
+
+sort_column: s32 = Model.COLUMN_CPU;
 sort_direction: s32 = -1;
 selected_row: s32 = -1;
 selected_pid: s32 = -1;
 selected_column: s32 = -1;
 scroll_offset: s32 = 0;
+
+app_selected_row: s32 = -1;
+app_selected_window: u64;
+app_selected_column: s32 = -1;
+app_scroll_offset: s32 = 0;
+
+refresh_interval_ms: s64 = SPEED_NORMAL_MS;
 frames_since_refresh: s32;
 last_refresh_ms: s64 = -1;
 pending_sort: bool;
 refresh_requested: bool;
+show_kernel_times: bool;
+confirm_end: bool = true;
+group_processes: bool = true;
+
+dialog: s32 = DIALOG_NONE;
+end_pid: s32 = -1;
+command_bytes: [Model.COMMAND_CAPACITY]u8;
+command_next: [Model.COMMAND_CAPACITY]u8;
+command_length: s32;
+command_pending: bool;
+command_cursor: s32;
+command_anchor: s32;
+command_scroll: s32;
+typed: [64]u8;
 
 // The status message is stored as raw bytes; no global retains a string view
 // into it, so it can be rewritten between frames. The interface builds its
 // display strings into frame locals every frame.
 status_bytes: [STATUS_WIDTH]u8;
 status_length: s32;
+
+Color32 :: (packed: u32) -> Color {
+    return ColorFromPacked(packed)
+}
+
+Inset :: (bounds: Rectangle, amount: float32) -> Rectangle {
+    width := bounds.width - amount * 2.0
+    height := bounds.height - amount * 2.0
+    if width < 0.0 { width = 0.0 }
+    if height < 0.0 { height = 0.0 }
+    return .{bounds.x + amount, bounds.y + amount, width, height}
+}
 
 TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
     accent: bool, disabled: bool) -> bool {
@@ -66,6 +162,8 @@ TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
     props.bounds = bounds
     props.label = label
     props.disabled = disabled
+    // Outlined neutral buttons read as the classic bordered push buttons.
+    props.emphasis = ButtonEmphasis.ButtonEmphasisOutline
     if accent {
         props.tone = ButtonTone.ButtonToneAccent
         props.emphasis = ButtonEmphasis.ButtonEmphasisFilled
@@ -73,10 +171,44 @@ TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
     return Button(session, props) == 1
 }
 
+ValueLabel :: (session: Session, key: s32, text: string, bounds: Rectangle, font: s32) {
+    Text(session, TextProps.{.key = cast(u64)key, .bounds = bounds, .text = text, .font = font,
+        .align = TextAlign.TextAlignEnd})
+}
+
+CenteredLabel :: (session: Session, key: s32, text: string, bounds: Rectangle, font: s32) {
+    Text(session, TextProps.{.key = cast(u64)key, .bounds = bounds, .text = text, .font = font,
+        .align = TextAlign.TextAlignCenter})
+}
+
+// Picks the starting tab from TASKMGR_TAB, matching its first letter.
+StartingTab :: () -> s32 {
+    variable := "TASKMGR_TAB"
+    name: [16]u8
+    length: s32 = 0
+    for byte: variable {
+        name[length] = byte
+        length += 1
+    }
+    name[length] = 0
+    value := Environment(*name[0])
+    if value == null { return TAB_PROCESSES }
+    first := value[0]
+    if first == 97 || first == 65 { return TAB_APPLICATIONS }
+    if first == 112 && value[1] == 101 { return TAB_PERFORMANCE }
+    if first == 80 && value[1] == 101 { return TAB_PERFORMANCE }
+    return TAB_PROCESSES
+}
+
 // Rebuilds the display order and one text generation from the current
 // snapshot. Callers write only the generation without live row views.
+ProcessSnapshot :: () -> *Model.Snapshot {
+    if group_processes { return Model.GroupedCurrent() }
+    return Model.Current()
+}
+
 RebuildOrder :: (store: *CellText) {
-    snapshot := Model.Current()
+    snapshot := ProcessSnapshot()
     selected_row = -1
     Model.SortOrder(snapshot, order[:], sort_column, sort_direction)
     if snapshot.count > 0 {
@@ -93,14 +225,39 @@ RebuildOrder :: (store: *CellText) {
                     store.name[name_base + name_index] = entry.name[name_index]
                 }
             }
-            store.cell[base + 0] = TextView(store.name[name_base:name_base + name_length])
-            store.cell[base + 1] = Number.FormatInteger(cast(s64)entry.pid,
-                store.pid[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
-            store.cell[base + 2] = Number.FormatDecimal(entry.cpu_percent,
-                1, store.cpu[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
-            store.cell[base + 3] = Model.FormatBytes(entry.memory_bytes,
-                store.mem[index * CELL_WIDTH:(index + 1) * CELL_WIDTH])
-            store.cell[base + 4] = Model.StateName(entry.state)
+            if entry.group_count > 1 && name_length < NAME_WIDTH {
+                store.name[name_base + name_length] = 32
+                name_length += 1
+                if name_length < NAME_WIDTH {
+                    store.name[name_base + name_length] = 40
+                    name_length += 1
+                }
+                group_digits: [16]u8
+                group_text := Number.FormatInteger(cast(s64)entry.group_count, group_digits[:])
+                for byte: group_text {
+                    if name_length >= NAME_WIDTH { break }
+                    store.name[name_base + name_length] = byte
+                    name_length += 1
+                }
+                if name_length < NAME_WIDTH {
+                    store.name[name_base + name_length] = 41
+                    name_length += 1
+                }
+            }
+            cell := index * CELL_WIDTH
+            store.cell[base + Model.COLUMN_NAME] = TextView(store.name[name_base:name_base + name_length])
+            if entry.group_count > 1 {
+                store.cell[base + Model.COLUMN_PID] = "-"
+            } else {
+                store.cell[base + Model.COLUMN_PID] = Number.FormatInteger(cast(s64)entry.pid,
+                    store.pid[cell:cell + CELL_WIDTH])
+            }
+            store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
+                store.cpu[cell:cell + CELL_WIDTH])
+            store.cell[base + Model.COLUMN_CPU_TIME] = Model.FormatCpuTime(entry.ticks,
+                store.time[cell:cell + CELL_WIDTH])
+            store.cell[base + Model.COLUMN_MEMORY] = Model.FormatKilobytes(entry.memory_bytes,
+                store.mem[cell:cell + CELL_WIDTH])
         }
     }
 }
@@ -113,6 +270,47 @@ BuildOrder :: () {
         RebuildOrder(*text_stores_a)
         text_active = 0
     }
+}
+
+// The Status column: a window whose process the kernel has stopped cannot
+// answer, as a hung program could not on the classic task manager.
+AppStatus :: (pid: s32) -> string {
+    if pid <= 0 { return "Running" }
+    snapshot := Model.Current()
+    index := Model.FindProcess(snapshot, pid)
+    if index >= 0 && snapshot.processes[index].state == Model.STATE_STOPPED {
+        return "Not Responding"
+    }
+    return "Running"
+}
+
+RebuildApps :: (store: *AppText) {
+    Apps.AppsRefresh(*store.list)
+    app_selected_row = -1
+    if store.list.count > 0 {
+        for index: 0..store.list.count - 1 {
+            entry := *store.list.windows[index]
+            if entry.id == app_selected_window { app_selected_row = index }
+            store.cell[index * APP_COLUMNS] = TextView(entry.title[0:entry.title_count])
+            store.cell[index * APP_COLUMNS + 1] = AppStatus(entry.pid)
+        }
+    }
+    if app_selected_row < 0 { app_selected_window = 0 }
+}
+
+BuildApps :: () {
+    if app_active == 0 {
+        RebuildApps(*app_stores_b)
+        app_active = 1
+    } else {
+        RebuildApps(*app_stores_a)
+        app_active = 0
+    }
+}
+
+ActiveApps :: () -> *Apps.AppList {
+    if app_active == 0 { return *app_stores_a.list }
+    return *app_stores_b.list
 }
 
 // Copies the message parts into the raw status bytes for later frames.
@@ -128,94 +326,316 @@ SetStatus :: (parts: []string) {
     status_length = length
 }
 
-#program_export
-Frame :: (session: Session, viewport: Rectangle) -> s32 {
-    frames_since_refresh += 1
-    now_ms := Timer.MonotonicMilliseconds()
-    refreshed := last_refresh_ms < 0
-    if now_ms >= 0 && last_refresh_ms >= 0 &&
-       (now_ms < last_refresh_ms || now_ms - last_refresh_ms >= REFRESH_INTERVAL_MS) {
-        refreshed = true
+SetStatusText :: (text: string) {
+    parts: [1]string = .{text}
+    SetStatus(parts[:])
+}
+
+ColumnWidths :: (width: float32) {
+    if widths_for == width { return }
+    widths_for = width
+    usable := width - 18.0
+    for column: 0..COLUMNS - 1 {
+        value := cast(s32)(usable * process_fractions[column])
+        if value < 40 { value = 40 }
+        process_widths[column] = value
     }
-    if now_ms < 0 && frames_since_refresh >= REFRESH_FALLBACK_FRAMES { refreshed = true }
-    if refresh_requested { refreshed = true }
-    if refreshed {
-        Model.Refresh()
-        frames_since_refresh = 0
-        if now_ms >= 0 { last_refresh_ms = now_ms } else { last_refresh_ms = 0 }
-        refresh_requested = false
+    for column: 0..APP_COLUMNS - 1 {
+        value := cast(s32)(usable * app_fractions[column])
+        if value < 60 { value = 60 }
+        app_widths[column] = value
     }
-    if refreshed || pending_sort {
-        BuildOrder()
-        pending_sort = false
+}
+
+MenuBar :: (session: Session, bounds: Rectangle) -> s32 {
+    if !menu_state.initialized { MenuStateInit(*menu_state) }
+    file_items: [3]MenuItem
+    file_items[0].id = MENU_NEW_TASK
+    file_items[0].label = "New Task (Run...)"
+    file_items[1].kind = MenuItemKind.MenuSeparator
+    file_items[2].id = MENU_EXIT
+    file_items[2].label = "Exit Task Manager"
+
+    option_items: [2]MenuItem
+    option_items[0].kind = MenuItemKind.MenuCheck
+    option_items[0].id = MENU_CONFIRM_END
+    option_items[0].label = "Confirm Before Ending Processes"
+    option_items[0].checked = confirm_end
+    option_items[1].kind = MenuItemKind.MenuCheck
+    option_items[1].id = MENU_GROUP_PROCESSES
+    option_items[1].label = "Group Processes"
+    option_items[1].checked = group_processes
+
+    speed_items: [4]MenuItem
+    speed_labels: [4]string = .{"High", "Normal", "Low", "Paused"}
+    speed_values: [4]s64 = .{SPEED_HIGH_MS, SPEED_NORMAL_MS, SPEED_LOW_MS, 0}
+    for index: 0..3 {
+        speed_items[index].kind = MenuItemKind.MenuRadio
+        speed_items[index].id = MENU_SPEED_HIGH + cast(s32)index
+        speed_items[index].label = speed_labels[index]
+        speed_items[index].checked = refresh_interval_ms == speed_values[index]
     }
+    view_items: [4]MenuItem
+    view_items[0].id = MENU_REFRESH
+    view_items[0].label = "Refresh Now"
+    view_items[1].kind = MenuItemKind.MenuSubmenu
+    view_items[1].label = "Update Speed"
+    view_items[1].submenu = speed_items[:]
+    view_items[2].kind = MenuItemKind.MenuSeparator
+    view_items[3].kind = MenuItemKind.MenuCheck
+    view_items[3].id = MENU_KERNEL_TIMES
+    view_items[3].label = "Show Kernel Times"
+    view_items[3].checked = show_kernel_times
+
+    help_items: [1]MenuItem
+    help_items[0].id = MENU_ABOUT
+    help_items[0].label = "About Task Manager"
+
+    groups: [4]MenuGroup
+    groups[0].label = "File"
+    groups[0].items = file_items[:]
+    groups[1].label = "Options"
+    groups[1].items = option_items[:]
+    groups[2].label = "View"
+    groups[2].items = view_items[:]
+    groups[3].label = "Help"
+    groups[3].items = help_items[:]
+    return Menu(session, MenuProps.{.key = 20, .bounds = bounds}, groups[:], *menu_state).activated_id
+}
+
+RunMenu :: (id: s32) {
+    if id == MENU_NEW_TASK { OpenRunDialog() }
+    if id == MENU_EXIT { Window.WindowQuit() }
+    if id == MENU_CONFIRM_END { confirm_end = !confirm_end }
+    if id == MENU_GROUP_PROCESSES {
+        group_processes = !group_processes
+        selected_row = -1
+        selected_pid = -1
+        selected_column = -1
+        scroll_offset = 0
+        pending_sort = true
+    }
+    if id == MENU_REFRESH { refresh_requested = true }
+    if id == MENU_SPEED_HIGH { refresh_interval_ms = SPEED_HIGH_MS }
+    if id == MENU_SPEED_NORMAL { refresh_interval_ms = SPEED_NORMAL_MS }
+    if id == MENU_SPEED_LOW { refresh_interval_ms = SPEED_LOW_MS }
+    if id == MENU_SPEED_PAUSED { refresh_interval_ms = 0 }
+    if id == MENU_KERNEL_TIMES { show_kernel_times = !show_kernel_times }
+    if id == MENU_ABOUT { dialog = DIALOG_ABOUT }
+}
+
+OpenRunDialog :: () {
+    dialog = DIALOG_RUN
+    command_pending = false
+    command_length = 0
+    command_cursor = 0
+    command_anchor = 0
+    command_scroll = 0
+}
+
+// Writes the field's text with one edit applied into command_next; the next
+// frame's SettleCommand copies it back.
+ApplyEdit :: (length: s32, edit: TextFieldEdit) -> s32 {
+    if !edit.changed { return length }
+    if edit.start < 0 || edit.end < edit.start || edit.end > length { return length }
+    new_length := length - (edit.end - edit.start) + cast(s32)edit.replacement.count
+    if new_length > Model.COMMAND_CAPACITY { return length }
+    at: s32 = 0
+    if edit.start > 0 {
+        for index: 0..edit.start - 1 { command_next[at] = command_bytes[index]; at += 1 }
+    }
+    for byte: edit.replacement { command_next[at] = byte; at += 1 }
+    if edit.end < length {
+        for index: edit.end..length - 1 { command_next[at] = command_bytes[index]; at += 1 }
+    }
+    command_pending = true
+    return new_length
+}
+
+// Moves the previous frame's edit into the field's text before any view of
+// it is taken this frame.
+SettleCommand :: () {
+    if !command_pending { return }
+    if command_length > 0 {
+        for index: 0..command_length - 1 { command_bytes[index] = command_next[index] }
+    }
+    command_pending = false
+}
+
+RunCommand :: () {
+    SettleCommand()
+    command := TextView(command_bytes[0:command_length])
+    if Model.StartTask(command) {
+        parts: [2]string = .{"Started ", command}
+        SetStatus(parts[:])
+        refresh_requested = true
+    } else {
+        SetStatusText("Could not start that command.")
+    }
+    dialog = DIALOG_NONE
+}
+
+RunDialog :: (session: Session, font: s32) {
+    SettleCommand()
+    modal := ModalFrame(session, ModalFrameProps.{.key = 300, .title = "Create New Task",
+        .width = 460, .height = 210, .left_label = "Cancel", .right_label = "OK",
+        .has_left_action = true, .has_right_action = true})
+    commit := modal.right_clicked
+    if modal.opened {
+        area := modal.layout.content
+        Label(session, 301, "Type the command to run. It starts in the background.",
+            .{area.x, area.y, area.width, 22.0}, font)
+        key := KeyboardTake(session)
+        text := TypedTextTake(session, typed[:])
+        input := TextFieldInputFor(key, KeyboardModifiers(session), text)
+        result := TextField(session, TextFieldProps.{.key = 302, .id = 302,
+            .bounds = .{area.x, area.y + 30.0, area.width, 36.0},
+            .value = TextView(command_bytes[0:command_length]), .label = "Open",
+            .placeholder = "for example: xterm", .max_bytes = Model.COMMAND_CAPACITY,
+            .cursor = command_cursor, .anchor = command_anchor, .scroll_x = command_scroll,
+            .focused = true, .input = input})
+        command_cursor = result.cursor
+        command_anchor = result.anchor
+        command_scroll = result.scroll_x
+        command_length = ApplyEdit(command_length, result.edit)
+        if result.committed { commit = true }
+        if result.escaped { dialog = DIALOG_NONE }
+        unused End(session)
+    }
+    if modal.dismissed || modal.left_clicked { dialog = DIALOG_NONE }
+    if commit && dialog == DIALOG_RUN { RunCommand() }
+}
+
+AboutDialog :: (session: Session) {
+    actions: [1]ActionModalAction
+    actions[0].label = "OK"
+    actions[0].tone = ButtonTone.ButtonToneAccent
+    actions[0].emphasis = ButtonEmphasis.ButtonEmphasisFilled
+    answer := ActionModal(session, ActionModalProps.{.key = 310, .title = "About Task Manager",
+        .message = "taskmgr shows the applications, processes and performance of this Linux computer. It reads /proc directly and lists windows from the X11 window manager.",
+        .max_width = 440}, actions[:])
+    if answer.action != 0 { dialog = DIALOG_NONE }
+}
+
+EndSelectedProcess :: () {
     snapshot := Model.Current()
-
-    page := PageFor(viewport, 640.0)
-    left := viewport.x + 16.0
-    content_width := viewport.width - 32.0
-    y := viewport.y + 12.0
-
-    Label(session, 2, "Task Manager", .{left, y, content_width, 34.0}, FontSize(*page, 26))
-    y += 42.0
-
-    cpu_percent_line: [32]u8
-    cpu_line: [96]u8
-    cpu_parts: [3]string = .{"CPU  ",
-        Number.FormatDecimal(snapshot.cpu_percent, 1, cpu_percent_line[:]), "%"}
-    Label(session, 3, JoinAll(cpu_parts[:], cpu_line[:]), .{left, y, content_width, 18.0},
-        FontSize(*page, 15))
-    y += 22.0
-
-    memory_percent: s32 = 0
-    if snapshot.memory_total > 0 {
-        memory_percent = cast(s32)(100.0 * cast(float64)snapshot.memory_used
-            / cast(float64)snapshot.memory_total + 0.5)
+    index := Model.FindProcess(snapshot, end_pid)
+    if index < 0 {
+        SetStatusText("That process has already exited.")
+        return
     }
-    mem_used_line: [32]u8
-    mem_total_line: [32]u8
-    mem_line: [128]u8
-    mem_parts: [4]string = .{"Memory  ", Model.FormatBytes(snapshot.memory_used, mem_used_line[:]),
-        " / ", Model.FormatBytes(snapshot.memory_total, mem_total_line[:])}
-    Label(session, 4, JoinAll(mem_parts[:], mem_line[:]), .{left, y, content_width, 18.0},
-        FontSize(*page, 15))
-    y += 22.0
-
-    cpu_value := cast(s32)snapshot.cpu_percent
-    if cpu_value < 0 { cpu_value = 0 }
-    if cpu_value > 100 { cpu_value = 100 }
-    if !page.cells {
-        cpu_progress: ProgressProps
-        cpu_progress.key = 30
-        cpu_progress.bounds = .{left, y, content_width, 14.0}
-        cpu_progress.min = 0
-        cpu_progress.max = 100
-        cpu_progress.value = cpu_value
-        cpu_progress.label = "Total CPU"
-        Progress(session, cpu_progress)
-        y += 20.0
-        memory_progress: ProgressProps
-        memory_progress.key = 31
-        memory_progress.bounds = .{left, y, content_width, 14.0}
-        memory_progress.min = 0
-        memory_progress.max = 100
-        memory_progress.value = memory_percent
-        memory_progress.label = "Memory used"
-        Progress(session, memory_progress)
-        y += 22.0
+    target := snapshot.processes[index]
+    name_length := target.name_count
+    if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
+    name_line: [NAME_WIDTH]u8
+    if name_length > 0 {
+        for name_index: 0..name_length - 1 { name_line[name_index] = target.name[name_index] }
     }
+    pid_line: [16]u8
+    pid_text := Number.FormatInteger(cast(s64)target.pid, pid_line[:])
+    if Model.EndTask(target.pid) {
+        refresh_requested = true
+        parts: [5]string = .{"Sent stop signal to ", TextView(name_line[0:name_length]),
+            " (PID ", pid_text, ")"}
+        SetStatus(parts[:])
+    } else {
+        SetStatusText("Could not end the selected process.")
+    }
+}
 
-    if !widths_ready {
-        for column: 0..COLUMNS - 1 {
-            width := cast(s32)(cast(float32)(viewport.width - 24.0) * column_fractions[column])
-            if width < 48 { width = 48 }
-            column_widths[column] = width
+EndProcessDialog :: (session: Session) {
+    snapshot := Model.Current()
+    index := Model.FindProcess(snapshot, end_pid)
+    name_line: [NAME_WIDTH]u8
+    name_length: s32 = 0
+    if index >= 0 {
+        name_length = snapshot.processes[index].name_count
+        if name_length > NAME_WIDTH { name_length = NAME_WIDTH }
+        if name_length > 0 {
+            for name_index: 0..name_length - 1 {
+                name_line[name_index] = snapshot.processes[index].name[name_index]
+            }
         }
-        widths_ready = true
+    }
+    pid_line: [16]u8
+    message_line: [256]u8
+    parts: [5]string = .{"Ending a process can lose unsaved data or leave the system unstable. End ",
+        TextView(name_line[0:name_length]), " (PID ",
+        Number.FormatInteger(cast(s64)end_pid, pid_line[:]), ")?"}
+    actions: [2]ActionModalAction
+    actions[0].label = "No"
+    actions[1].label = "Yes"
+    actions[1].tone = ButtonTone.ButtonToneDanger
+    actions[1].emphasis = ButtonEmphasis.ButtonEmphasisFilled
+    answer := ActionModal(session, ActionModalProps.{.key = 320, .title = "Task Manager Warning",
+        .message = JoinAll(parts[:], message_line[:]), .max_width = 460}, actions[:])
+    if answer.action == 2 { EndSelectedProcess() }
+    if answer.action != 0 { dialog = DIALOG_NONE }
+}
+
+ApplicationsTab :: (session: Session, area: Rectangle) {
+    list := ActiveApps()
+    table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
+    if table_bounds.height < 60.0 { table_bounds.height = 60.0 }
+    rows: [Apps.MAX_WINDOWS]Tables.TableRow
+    count := list.count
+    if app_active == 0 {
+        if count > 0 {
+            for index: 0..count - 1 {
+                rows[index].cells = app_stores_a.cell[index * APP_COLUMNS:(index + 1) * APP_COLUMNS]
+            }
+        }
+    } else {
+        if count > 0 {
+            for index: 0..count - 1 {
+                rows[index].cells = app_stores_b.cell[index * APP_COLUMNS:(index + 1) * APP_COLUMNS]
+            }
+        }
+    }
+    table := Tables.TableView(session, Tables.TableViewProps.{.key = 200,
+        .bounds = table_bounds, .columns = app_columns[:], .rows = rows[0:count],
+        .column_widths = app_widths[:], .selected_row = app_selected_row,
+        .selected_column = app_selected_column, .sort_column = -1,
+        .scroll_offset = app_scroll_offset, .row_height = 26, .header_height = 30,
+        .resizable = true})
+    app_selected_row = table.selected_row
+    app_selected_column = table.selected_column
+    app_scroll_offset = table.scroll_offset
+    app_selected_window = 0
+    if app_selected_row >= 0 && app_selected_row < count {
+        app_selected_window = list.windows[app_selected_row].id
+    }
+    if !list.available {
+        CenteredLabel(session, 205, "No window manager task list is available on this display.",
+            .{table_bounds.x, table_bounds.y + 60.0, table_bounds.width, 24.0}, 14)
     }
 
-    table_height := viewport.y + viewport.height - y - 78.0
-    if table_height < 60.0 { table_height = 60.0 }
+    button_y := area.y + area.height - BUTTON_HEIGHT
+    right := area.x + area.width
+    none := app_selected_window == 0
+    if TaskButton(session, 210, "End Task", .{right - BUTTON_WIDTH * 3.0 - 16.0, button_y,
+            BUTTON_WIDTH, BUTTON_HEIGHT}, false, none) && !none {
+        if Apps.AppsCloseWindow(app_selected_window) {
+            SetStatusText("Asked the window to close.")
+            refresh_requested = true
+        } else {
+            SetStatusText("Could not reach the window manager.")
+        }
+    }
+    if TaskButton(session, 211, "Switch To", .{right - BUTTON_WIDTH * 2.0 - 8.0, button_y,
+            BUTTON_WIDTH, BUTTON_HEIGHT}, false, none) && !none {
+        if !Apps.AppsSwitchTo(app_selected_window) { SetStatusText("Could not reach the window manager.") }
+    }
+    if TaskButton(session, 212, "New Task...", .{right - BUTTON_WIDTH, button_y,
+            BUTTON_WIDTH, BUTTON_HEIGHT}, false, false) {
+        OpenRunDialog()
+    }
+}
+
+ProcessesTab :: (session: Session, area: Rectangle) {
+    snapshot := ProcessSnapshot()
+    table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
+    if table_bounds.height < 60.0 { table_bounds.height = 60.0 }
     table_rows: [Model.MAX_PROCESSES]Tables.TableRow
     if text_active == 0 {
         if snapshot.count > 0 {
@@ -231,14 +651,14 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         }
     }
     table := Tables.TableView(session, Tables.TableViewProps.{.key = 100,
-        .bounds = .{viewport.x + 8.0, y, viewport.width - 16.0, table_height},
-        .columns = table_columns[:], .rows = table_rows[0:snapshot.count],
-        .column_widths = column_widths[:], .selected_row = selected_row,
-        .selected_column = selected_column, .sort_column = sort_column,
+        .bounds = table_bounds, .columns = process_columns[:], .rows = table_rows[0:snapshot.count],
+        .column_widths = process_widths[:], .selected_row = selected_row,
+        .selected_column = -1, .sort_column = sort_column,
         .sort_direction = sort_direction, .scroll_offset = scroll_offset,
         .row_height = 26, .header_height = 30, .resizable = true})
     selected_row = table.selected_row
-    selected_column = table.selected_column
+    // A process is a row, not a cell: every column keeps the selected face.
+    selected_column = -1
     scroll_offset = table.scroll_offset
     selected_pid = -1
     if selected_row >= 0 && selected_row < snapshot.count {
@@ -250,57 +670,292 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         pending_sort = true
     }
 
-    status_line: [STATUS_WIDTH]u8
-    status_text: string = "Select a process, then End Task to stop it."
+    button_y := area.y + area.height - BUTTON_HEIGHT
+    grouped := selected_row >= 0 && selected_row < snapshot.count &&
+        snapshot.processes[order[selected_row]].group_count > 1
+    none := selected_pid <= 0 || grouped
+    if TaskButton(session, 110, "End Process", .{area.x + area.width - BUTTON_WIDTH, button_y,
+            BUTTON_WIDTH, BUTTON_HEIGHT}, false, none) && !none {
+        end_pid = selected_pid
+        if confirm_end { dialog = DIALOG_END_PROCESS } else { EndSelectedProcess() }
+    }
+}
+
+HistoryGraph :: (session: Session, key: s32, bounds: Rectangle, label: string, kind: s32,
+    with_kernel: bool) {
+    // Classic Task Manager graph: a clean green trace on black, with no grid
+    // or endpoint marker. The surrounding fieldset carries the visible title.
+    Box(session, BoxProps.{.key = cast(u64)key, .bounds = bounds,
+        .fill = Color32(cast(u32)0x000000ff),
+        .border = Color32(cast(u32)0x008000ff), .radius = 0.0})
+    values: [Model.HISTORY_LENGTH]float32
+    series := Model.History(kind, values[:])
+    count := cast(s32)series.count
+    if count > 1 {
+        inner := Rectangle.{bounds.x + 2.0, bounds.y + 2.0,
+            bounds.width - 4.0, bounds.height - 4.0}
+        for index: 1..count - 1 {
+            x0 := inner.x + inner.width * cast(float32)(index - 1) / cast(float32)(count - 1)
+            x1 := inner.x + inner.width * cast(float32)index / cast(float32)(count - 1)
+            y0 := inner.y + inner.height * (1.0 - series[index - 1] / 100.0)
+            y1 := inner.y + inner.height * (1.0 - series[index] / 100.0)
+            PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0},
+                Color32(cast(u32)0x00ff00ff))
+        }
+        if with_kernel {
+            kernel_values: [Model.HISTORY_LENGTH]float32
+            kernel := Model.History(Model.HISTORY_KERNEL, kernel_values[:])
+            for index: 1..count - 1 {
+                x0 := inner.x + inner.width * cast(float32)(index - 1) / cast(float32)(count - 1)
+                x1 := inner.x + inner.width * cast(float32)index / cast(float32)(count - 1)
+                y0 := inner.y + inner.height * (1.0 - kernel[index - 1] / 100.0)
+                y1 := inner.y + inner.height * (1.0 - kernel[index] / 100.0)
+                PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0},
+                    Color32(cast(u32)0xff0000ff))
+            }
+        }
+    }
+    unused label
+}
+
+// One "Label    value" row inside a group box.
+InfoRow :: (session: Session, key: s32, area: Rectangle, row: s32, label: string, value: string,
+    font: s32) {
+    y := area.y + cast(float32)row * 20.0
+    Label(session, key, label, .{area.x, y, area.width * 0.55, 18.0}, font)
+    ValueLabel(session, key + 1, value, .{area.x + area.width * 0.45, y, area.width * 0.55, 18.0}, font)
+}
+
+GroupContent :: (bounds: Rectangle) -> Rectangle {
+    return .{bounds.x + 12.0, bounds.y + 22.0, bounds.width - 24.0, bounds.height - 30.0}
+}
+
+PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: string,
+    semantic_label: string, history_kind: s32, reading: string, font: s32,
+    with_kernel: bool) {
+    Fieldset(session, FieldsetProps.{.key = cast(u64)key, .bounds = bounds, .title = title})
+    content := GroupContent(bounds)
+    reading_height: float32 = 18.0
+    graph := Rectangle.{content.x, content.y, content.width, content.height - reading_height - 3.0}
+    if graph.height < 20.0 { graph.height = 20.0 }
+    HistoryGraph(session, key + 1, graph, semantic_label, history_kind, with_kernel)
+    CenteredLabel(session, key + 2, reading,
+        .{content.x, graph.y + graph.height + 3.0, content.width, reading_height}, font)
+}
+
+PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
+    snapshot := Model.Current()
+        half := (area.width - PAD) / 2.0
+        info_height: float32 = 92.0
+        info_block := info_height * 2.0 + PAD
+        graph_block := area.height - info_block - PAD
+        graph_height := (graph_block - PAD) / 2.0
+        if graph_height < 72.0 { graph_height = 72.0 }
+        right_x := area.x + half + PAD
+        second_graph_y := area.y + graph_height + PAD
+
+        cpu_digits: [16]u8
+        cpu_text: [24]u8
+        cpu_parts: [2]string = .{Model.FormatCpu(snapshot.cpu_percent, cpu_digits[:]), "%"}
+        PerformanceGraph(session, 400, .{area.x, area.y, half, graph_height},
+            "CPU Usage History", "CPU usage history", Model.HISTORY_CPU,
+            JoinAll(cpu_parts[:], cpu_text[:]), font, show_kernel_times)
+
+        memory_used: [32]u8
+        PerformanceGraph(session, 410, .{right_x, area.y, half, graph_height},
+            "Memory Usage History", "memory usage history", Model.HISTORY_MEMORY,
+            Model.FormatBytes(snapshot.memory_used, memory_used[:]), font, false)
+
+        gpu_reading: string = "n/a"
+        gpu_digits: [16]u8
+        gpu_text: [24]u8
+        if snapshot.gpu_count > 0 {
+            gpu_parts: [2]string = .{Model.FormatCpu(snapshot.gpu_percent, gpu_digits[:]), "%"}
+            gpu_reading = JoinAll(gpu_parts[:], gpu_text[:])
+        }
+        PerformanceGraph(session, 420, .{area.x, second_graph_y, half, graph_height},
+            "GPU Usage History", "GPU usage history", Model.HISTORY_GPU,
+            gpu_reading, font, false)
+
+        vram_reading: string = "n/a"
+        vram_used: [32]u8
+        vram_total: [32]u8
+        vram_text: [80]u8
+        if snapshot.vram_total > 0 {
+            vram_parts: [3]string = .{Model.FormatBytes(snapshot.vram_used, vram_used[:]),
+                " / ", Model.FormatBytes(snapshot.vram_total, vram_total[:])}
+            vram_reading = JoinAll(vram_parts[:], vram_text[:])
+        }
+        PerformanceGraph(session, 430, .{right_x, second_graph_y, half, graph_height},
+            "VRAM Usage History", "VRAM usage history", Model.HISTORY_VRAM,
+            vram_reading, font, false)
+
+        info_y := second_graph_y + graph_height + PAD
+        details := snapshot.memory
+        a: [32]u8
+        b: [32]u8
+        c: [32]u8
+        totals := Rectangle.{area.x, info_y, half, info_height}
+        Fieldset(session, FieldsetProps.{.key = 440, .bounds = totals, .title = "Totals"})
+        totals_area := GroupContent(totals)
+        InfoRow(session, 441, totals_area, 0, "Handles", Model.FormatThousands(snapshot.handles, a[:]), font)
+        InfoRow(session, 443, totals_area, 1, "Threads", Model.FormatThousands(snapshot.threads, b[:]), font)
+        InfoRow(session, 445, totals_area, 2, "Processes", Model.FormatThousands(cast(s64)snapshot.count, c[:]), font)
+
+        physical := Rectangle.{right_x, info_y, half, info_height}
+        Fieldset(session, FieldsetProps.{.key = 450, .bounds = physical, .title = "Physical Memory (K)"})
+        physical_area := GroupContent(physical)
+        d: [32]u8
+        e: [32]u8
+        f: [32]u8
+        InfoRow(session, 451, physical_area, 0, "Total", Model.FormatThousands(details.total_kb, d[:]), font)
+        InfoRow(session, 453, physical_area, 1, "Available", Model.FormatThousands(details.available_kb, e[:]), font)
+        InfoRow(session, 455, physical_area, 2, "System Cache", Model.FormatThousands(details.cache_kb, f[:]), font)
+
+        second_info_y := info_y + info_height + PAD
+        commit := Rectangle.{area.x, second_info_y, half, info_height}
+        Fieldset(session, FieldsetProps.{.key = 460, .bounds = commit, .title = "Commit Charge (K)"})
+        commit_area := GroupContent(commit)
+        g: [32]u8
+        h: [32]u8
+        i: [32]u8
+        InfoRow(session, 461, commit_area, 0, "Total", Model.FormatThousands(details.commit_kb, g[:]), font)
+        InfoRow(session, 463, commit_area, 1, "Limit", Model.FormatThousands(details.commit_limit_kb, h[:]), font)
+        InfoRow(session, 465, commit_area, 2, "Peak", Model.FormatThousands(Model.CommitPeakKb(), i[:]), font)
+
+        kernel := Rectangle.{right_x, second_info_y, half, info_height}
+        Fieldset(session, FieldsetProps.{.key = 470, .bounds = kernel, .title = "Kernel Memory (K)"})
+        kernel_area := GroupContent(kernel)
+        j: [32]u8
+        k: [32]u8
+        l: [32]u8
+        kernel_total: s64 = -1
+        if details.kernel_paged_kb >= 0 && details.kernel_nonpaged_kb >= 0 {
+            kernel_total = details.kernel_paged_kb + details.kernel_nonpaged_kb
+        }
+        InfoRow(session, 471, kernel_area, 0, "Total", Model.FormatThousands(kernel_total, j[:]), font)
+        InfoRow(session, 473, kernel_area, 1, "Paged", Model.FormatThousands(details.kernel_paged_kb, k[:]), font)
+        InfoRow(session, 475, kernel_area, 2, "Nonpaged", Model.FormatThousands(details.kernel_nonpaged_kb, l[:]), font)
+}
+
+// The status bar: process count, CPU usage and memory in use, each in its
+// own sunken pane as on the classic task manager.
+StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
+    theme := Theme.CurrentTheme()
+    snapshot := Model.Current()
+    Box(session, BoxProps.{.key = 500, .bounds = bounds, .fill = Color32(theme.colors.surface),
+        .border = Color32(theme.colors.subtle_border)})
+    count_line: [16]u8
+    processes_line: [48]u8
+    processes_parts: [2]string = .{"Processes: ", Number.FormatInteger(cast(s64)snapshot.count, count_line[:])}
+    cpu_line: [16]u8
+    cpu_text: [48]u8
+    cpu_parts: [3]string = .{"CPU Usage: ", Model.FormatCpu(snapshot.cpu_percent, cpu_line[:]), "%"}
+    used_line: [32]u8
+    total_line: [32]u8
+    memory_text: [96]u8
+    memory_parts: [4]string = .{"Mem Usage: ", Model.FormatBytes(snapshot.memory_used, used_line[:]),
+        " / ", Model.FormatBytes(snapshot.memory_total, total_line[:])}
+    texts: [3]string = .{JoinAll(processes_parts[:], processes_line[:]),
+        JoinAll(cpu_parts[:], cpu_text[:]), JoinAll(memory_parts[:], memory_text[:])}
+    widths: [3]float32 = .{0.24, 0.24, 0.52}
+    x := bounds.x + 4.0
+    for index: 0..2 {
+        width := (bounds.width - 16.0) * widths[index]
+        pane := Rectangle.{x, bounds.y + 3.0, width, bounds.height - 6.0}
+        Box(session, BoxProps.{.key = cast(u64)(501 + cast(s32)index * 2), .bounds = pane,
+            .fill = Color32(theme.colors.surface_sunken), .border = Color32(theme.colors.subtle_border),
+            .radius = theme.metrics.radius_mark})
+        Label(session, 502 + cast(s32)index * 2, texts[index], .{pane.x + 6.0, pane.y + 2.0, pane.width - 12.0,
+            pane.height - 4.0}, font)
+        x += width + 4.0
+    }
+}
+
+#program_export
+Frame :: (session: Session, viewport: Rectangle) -> s32 {
+    if !started {
+        unused SystemTheme.SystemPaletteInstall(SystemThemeLinux.SystemPaletteRead())
+        current_tab = StartingTab()
+        started = true
+    }
+    frames_since_refresh += 1
+    now_ms := Timer.MonotonicMilliseconds()
+    refreshed := last_refresh_ms < 0
+    if refresh_interval_ms > 0 {
+        if now_ms >= 0 && last_refresh_ms >= 0 &&
+           (now_ms < last_refresh_ms || now_ms - last_refresh_ms >= refresh_interval_ms) {
+            refreshed = true
+        }
+        if now_ms < 0 && frames_since_refresh >= REFRESH_FALLBACK_FRAMES { refreshed = true }
+    }
+    if refresh_requested { refreshed = true }
+    if refreshed {
+        Model.Refresh()
+        BuildApps()
+        frames_since_refresh = 0
+        if now_ms >= 0 { last_refresh_ms = now_ms } else { last_refresh_ms = 0 }
+        refresh_requested = false
+    }
+    if refreshed || pending_sort {
+        BuildOrder()
+        pending_sort = false
+    }
+
+    page := PageFor(viewport, 640.0)
+    font := FontSize(*page, 14)
+    small := FontSize(*page, 13)
+    theme := Theme.CurrentTheme()
+
+    Box(session, BoxProps.{.key = 1, .bounds = viewport, .fill = Color32(theme.colors.background)})
+
+    tabs_y := viewport.y + MENU_HEIGHT + 6.0
+    tabs: [3]Tab
+    tabs[0].label = "Applications"
+    tabs[1].label = "Processes"
+    tabs[2].label = "Performance"
+    tab_result := TabBar(session, TabBarProps.{.key = 40, .bounds = .{viewport.x + 8.0, tabs_y,
+        viewport.width - 16.0, TAB_HEIGHT}, .selected_index = current_tab, .content_sized = true},
+        tabs[:])
+    current_tab = tab_result.selected_index
+
+    status_y := viewport.y + viewport.height - STATUS_HEIGHT
+    panel_y := tabs_y + TAB_HEIGHT
+    panel := Rectangle.{viewport.x + 8.0, panel_y, viewport.width - 16.0, status_y - panel_y - 6.0}
+    if panel.height < 80.0 { panel.height = 80.0 }
+    Box(session, BoxProps.{.key = 41, .bounds = panel, .fill = Color32(theme.colors.surface),
+        .border = Color32(theme.colors.border), .radius = theme.metrics.radius_small})
+    content := Inset(panel, PAD)
+    ColumnWidths(content.width)
+    if current_tab == TAB_APPLICATIONS {
+        ApplicationsTab(session, content)
+    } else if current_tab == TAB_PERFORMANCE {
+        PerformanceTab(session, content, small)
+    } else {
+        ProcessesTab(session, content)
+    }
+
+    // Messages from the last action sit at the panel's bottom left.
     if status_length > 0 {
+        status_line: [STATUS_WIDTH]u8
         copy_length := status_length
         if copy_length > STATUS_WIDTH { copy_length = STATUS_WIDTH }
-        for copy_index: 0..copy_length - 1 {
-            status_line[copy_index] = status_bytes[copy_index]
-        }
-        status_text = TextView(status_line[0:copy_length])
-    }
-    Label(session, 121, status_text, .{left, viewport.y + viewport.height - 66.0,
-        content_width, 14.0}, FontSize(*page, 13))
-
-    button_y := viewport.y + viewport.height - 46.0
-    half := (viewport.width - 40.0) / 2.0
-    if TaskButton(session, 110, "Refresh now", .{left, button_y, half, 32.0}, false, false) {
-        refresh_requested = true
-    }
-    if TaskButton(session, 111, "End Task", .{left + 24.0 + half, button_y, half, 32.0},
-            true, selected_row < 0) && selected_row >= 0 {
-        slot := order[selected_row]
-        target := snapshot.processes[slot]
-        if Model.EndTask(target.pid) {
-            refresh_requested = true
-            pid_line: [16]u8
-            pid_text := Number.FormatInteger(cast(s64)target.pid, pid_line[:])
-            status_name_length := target.name_count
-            if status_name_length > NAME_WIDTH { status_name_length = NAME_WIDTH }
-            status_name_line: [NAME_WIDTH]u8
-            if status_name_length > 0 {
-                for name_index: 0..status_name_length - 1 {
-                    status_name_line[name_index] = target.name[name_index]
-                }
-            }
-            stop_parts: [5]string = .{"Sent stop signal to ",
-                TextView(status_name_line[0:status_name_length]),
-                " (pid ", pid_text, ")"}
-            SetStatus(stop_parts[:])
-        } else {
-            failed_parts: [1]string = .{"Could not stop the selected process."}
-            SetStatus(failed_parts[:])
+        for copy_index: 0..copy_length - 1 { status_line[copy_index] = status_bytes[copy_index] }
+        if current_tab != TAB_PERFORMANCE {
+            Label(session, 120, TextView(status_line[0:copy_length]),
+                .{content.x, content.y + content.height - BUTTON_HEIGHT + 8.0,
+                content.width - BUTTON_WIDTH * 3.0 - 32.0, 18.0}, small)
         }
     }
 
-    count_line: [16]u8
-    footer_line: [96]u8
-    count_text := Number.FormatInteger(cast(s64)snapshot.count, count_line[:])
-    footer_parts: [2]string = .{count_text, " processes"}
-    Label(session, 120, JoinAll(footer_parts[:], footer_line[:]),
-        .{left, viewport.y + viewport.height - 14.0, content_width, 12.0},
-        FontSize(*page, 12))
+    StatusBar(session, .{viewport.x, status_y, viewport.width, STATUS_HEIGHT}, small)
 
+    // The menu bar comes last so its open menus draw over the tab content.
+    activated := MenuBar(session, .{viewport.x, viewport.y, viewport.width, MENU_HEIGHT})
+    if activated > 0 { RunMenu(activated) }
+
+    if dialog == DIALOG_RUN { RunDialog(session, font) }
+    if dialog == DIALOG_ABOUT { AboutDialog(session) }
+    if dialog == DIALOG_END_PROCESS { EndProcessDialog(session) }
     return 0
 }

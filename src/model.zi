@@ -1,7 +1,8 @@
-// Process metrics read from /proc on Linux, plus the ordering and formatting
-// helpers the taskmgr interface uses. Refresh keeps two snapshots and swaps
-// between them each call, so CPU percentages come from the previous sample
-// without copying snapshot storage.
+// Process and system metrics read from /proc on Linux, plus the ordering and
+// formatting helpers the taskmgr interface uses. Refresh keeps two snapshots
+// and swaps between them each call, so CPU percentages come from the previous
+// sample without copying snapshot storage, and appends each sample to the
+// CPU, kernel CPU and memory histories the Performance graphs draw.
 using Files :: #import "std/file";
 Number :: #import "std/number_text";
 
@@ -9,14 +10,34 @@ libc :: #system_library "libc";
 SysConf :: (name: s32) -> s64 #foreign libc "sysconf";
 SendSignal :: (pid: s32, signal: s32) -> s32 #foreign libc "kill";
 ProcessId :: () -> s32 #foreign libc "getpid";
+RunShell :: (command: *u8) -> s32 #foreign libc "system";
 
 CLOCK_TICKS_NAME :: 2; // _SC_CLK_TCK
 PAGE_SIZE_NAME :: 30; // _SC_PAGESIZE
 STOP_SIGNAL :: 15; // SIGTERM
 
-MAX_PROCESSES :: 1024;
+// Keep the fixed snapshot bounded, but large enough for development hosts and
+// servers with several thousand visible processes. A lower cap silently hid
+// rows (including taskmgr's own test process) once /proc exceeded 1,024 PIDs.
+MAX_PROCESSES :: 8192;
 NAME_CAPACITY :: 64;
 COLUMNS :: 5;
+COMMAND_CAPACITY :: 1024;
+
+// Process table columns, in the classic task manager order.
+COLUMN_NAME :: 0;
+COLUMN_PID :: 1;
+COLUMN_CPU :: 2;
+COLUMN_CPU_TIME :: 3;
+COLUMN_MEMORY :: 4;
+
+// Samples kept for each Performance graph; one is taken per refresh.
+HISTORY_LENGTH :: 60;
+HISTORY_CPU :: 0;
+HISTORY_KERNEL :: 1;
+HISTORY_MEMORY :: 2;
+HISTORY_GPU :: 3;
+HISTORY_VRAM :: 4;
 
 STATE_RUNNING :: 82; // R
 STATE_SLEEPING :: 83; // S
@@ -33,29 +54,74 @@ Process :: struct {
     cpu_percent: float64
     memory_bytes: u64
     ticks: u64
+    threads: s32
+    // One for a raw process; more than one for an aggregated process group.
+    group_count: s32
+}
+
+// Memory figures from /proc/meminfo, in kilobytes as the kernel reports them.
+// Commit charge is Committed_AS against CommitLimit; kernel memory is the slab
+// allocator, split into reclaimable (paged) and unreclaimable (nonpaged).
+MemoryDetails :: struct {
+    total_kb: s64
+    available_kb: s64
+    cache_kb: s64
+    commit_kb: s64
+    commit_limit_kb: s64
+    kernel_paged_kb: s64
+    kernel_nonpaged_kb: s64
+    swap_total_kb: s64
+    swap_free_kb: s64
 }
 
 Snapshot :: struct {
     processes: [MAX_PROCESSES]Process
     count: s32
     cpu_percent: float64
+    kernel_percent: float64
     memory_used: u64
     memory_total: u64
     busy_ticks: u64
+    kernel_ticks: u64
     total_ticks: u64
+    threads: s64
+    // Allocated file handles from /proc/sys/fs/file-nr, or -1.
+    handles: s64
+    memory: MemoryDetails
+    gpu_percent: float64
+    gpu_count: s32
+    vram_used: u64
+    vram_total: u64
 }
 
 state_names: [7]string = .{"Running", "Sleeping", "Waiting", "Stopped", "Zombie", "Idle", "Other"};
 
 snapshots: [2]Snapshot;
 active: s32;
+// The highest commit charge seen while taskmgr runs.
+commit_peak_kb: s64;
+
+// Ring buffers of percentages; history_next is the slot the next sample takes.
+cpu_history: [HISTORY_LENGTH]float32;
+kernel_history: [HISTORY_LENGTH]float32;
+memory_history: [HISTORY_LENGTH]float32;
+gpu_history: [HISTORY_LENGTH]float32;
+vram_history: [HISTORY_LENGTH]float32;
+history_next: s32;
+history_count: s32;
 clock_ticks: float64;
 page_bytes: u64;
 timing_ready: bool;
+grouped_snapshot: Snapshot;
 
 #program_export
 Current :: () -> *Snapshot {
     return *snapshots[active]
+}
+
+#program_export
+GroupedCurrent :: () -> *Snapshot {
+    return *grouped_snapshot
 }
 
 #program_export
@@ -125,7 +191,7 @@ ParsePidName :: (name_bytes: []u8) -> s32 {
 
 // Parses /proc/<pid>/stat: the command name sits between the first '(' and the
 // last ')'; after it come the state and the numbered fields, where utime is
-// field 14, stime is field 15, and rss is field 24.
+// field 14, stime is field 15, num_threads is field 20, and rss is field 24.
 #program_export
 ParseStat :: (content: []u8, process: *Process) -> bool {
     EnsureTiming()
@@ -169,6 +235,7 @@ ParseStat :: (content: []u8, process: *Process) -> bool {
         if digits == 0 { return false }
         if !negative && field == 14 { utime = value }
         if !negative && field == 15 { stime = value }
+        if !negative && field == 20 { process.threads = cast(s32)value }
         if !negative && field == 24 { rss = value }
         field += 1
     }
@@ -211,12 +278,207 @@ CpuTotals :: (content: []u8) -> (busy: u64, total: u64, ok: bool) {
     return total_value - idle_value, total_value, true
 }
 
-// Reads the kilobyte value of a /proc/meminfo entry, such as "MemTotal:".
+// The kernel's share of /proc/stat's CPU time: system, irq and softirq, the
+// third, sixth and seventh values. Returns 0 when the line is too short.
+#program_export
+CpuKernelTicks :: (content: []u8) -> u64 {
+    cursor: s32 = 0
+    total_count := cast(s32)content.count
+    while cursor < total_count && content[cursor] != 32 { cursor += 1 }
+    kernel: u64 = 0
+    count: s32 = 0
+    while count < 7 && cursor < total_count {
+        while cursor < total_count && content[cursor] == 32 { cursor += 1 }
+        if cursor >= total_count || content[cursor] == 10 { break }
+        value: u64 = 0
+        while cursor < total_count && content[cursor] >= 48 && content[cursor] <= 57 {
+            value = value * 10 + cast(u64)(content[cursor] - 48)
+            cursor += 1
+        }
+        if count == 2 || count == 5 || count == 6 { kernel += value }
+        count += 1
+    }
+    if count < 7 { return 0 }
+    return kernel
+}
+
+// The first decimal number in content, such as /proc/sys/fs/file-nr's count of
+// allocated file handles; -1 when there is none.
+#program_export
+FirstNumber :: (content: []u8) -> s64 {
+    cursor: s32 = 0
+    total_count := cast(s32)content.count
+    while cursor < total_count && (content[cursor] < 48 || content[cursor] > 57) { cursor += 1 }
+    if cursor >= total_count { return -1 }
+    value: s64 = 0
+    while cursor < total_count && content[cursor] >= 48 && content[cursor] <= 57 {
+        value = value * 10 + cast(s64)(content[cursor] - 48)
+        cursor += 1
+    }
+    return value
+}
+
+IsDrmCardName :: (name: []u8) -> bool {
+    if name.count <= 4 || name[0] != 99 || name[1] != 97 ||
+       name[2] != 114 || name[3] != 100 { return false }
+    for index: 4..cast(s32)name.count - 1 {
+        if name[index] < 48 || name[index] > 57 { return false }
+    }
+    return true
+}
+
+DrmPath :: (card: []u8, leaf: string, output: []u8) -> string {
+    length := Append(output, 0, "/sys/class/drm/")
+    for byte: card {
+        if length >= cast(s32)output.count { break }
+        output[length] = byte
+        length += 1
+    }
+    length = Append(output, length, "/device/")
+    length = Append(output, length, leaf)
+    return TextView(output[0:length])
+}
+
+// Samples every DRM card that exposes the standard Linux sysfs counters.
+// Usage is the average busy percentage; VRAM is summed across the adapters.
+ReadGpuStats :: (snapshot: *Snapshot) {
+    directory := Files.OpenDirectory("/sys/class/drm")
+    buffer: [128]u8
+    path: [160]u8
+    gpu_sum: s64 = 0
+    while true {
+        entry := Files.NextDirectoryEntry(*directory)
+        if !entry.valid { break }
+        card := entry.name[0:entry.name_count]
+        if !IsDrmCardName(card) { continue }
+        length := ReadSmall(DrmPath(card, "gpu_busy_percent", path[:]), buffer[:])
+        if length > 0 {
+            busy := FirstNumber(buffer[0:length])
+            if busy >= 0 {
+                if busy > 100 { busy = 100 }
+                gpu_sum += busy
+                snapshot.gpu_count += 1
+            }
+        }
+        used_length := ReadSmall(DrmPath(card, "mem_info_vram_used", path[:]), buffer[:])
+        total_length := ReadSmall(DrmPath(card, "mem_info_vram_total", path[:]), buffer[:])
+        if used_length > 0 && total_length > 0 {
+            used := FirstNumber(buffer[0:used_length])
+            total := FirstNumber(buffer[0:total_length])
+            if used >= 0 && total > 0 {
+                snapshot.vram_used += cast(u64)used
+                snapshot.vram_total += cast(u64)total
+            }
+        }
+    }
+    Files.CloseDirectory(*directory)
+    if snapshot.gpu_count > 0 {
+        snapshot.gpu_percent = cast(float64)gpu_sum / cast(float64)snapshot.gpu_count
+    }
+}
+
+LowerByte :: (byte: u8) -> u8 {
+    if byte >= 65 && byte <= 90 { return byte + cast(u8)32 }
+    return byte
+}
+
+#program_export
+IsCodexProcessName :: (name: []u8) -> bool {
+    if name.count < 5 { return false }
+    target: [5]u8 = .[99, 111, 100, 101, 120]
+    for index: 0..4 {
+        if LowerByte(name[index]) != target[index] { return false }
+    }
+    return true
+}
+
+SameProcessGroup :: (left: *Process, right: *Process) -> bool {
+    left_name := left.name[0:left.name_count]
+    right_name := right.name[0:right.name_count]
+    if IsCodexProcessName(left_name) && IsCodexProcessName(right_name) { return true }
+    if left.name_count != right.name_count { return false }
+    if left.name_count > 0 {
+        for index: 0..left.name_count - 1 {
+            if LowerByte(left.name[index]) != LowerByte(right.name[index]) { return false }
+        }
+    }
+    return true
+}
+
+// Aggregates processes with the same image name. Codex-family names share the
+// canonical lower-case "codex" group requested by the process-table option.
+#program_export
+BuildGroupedSnapshot :: (source: *Snapshot, target: *Snapshot) {
+    target.count = 0
+    if source.count <= 0 { return }
+    for index: 0..source.count - 1 {
+        entry := source.processes[index]
+        group: s32 = -1
+        if target.count > 0 {
+            for candidate: 0..target.count - 1 {
+                if SameProcessGroup(*target.processes[candidate], *entry) {
+                    group = candidate
+                    break
+                }
+            }
+        }
+        if group < 0 {
+            group = target.count
+            target.processes[group] = entry
+            target.processes[group].group_count = 1
+            if IsCodexProcessName(entry.name[0:entry.name_count]) {
+                target.processes[group].name_count = 5
+                target.processes[group].name[0] = 99
+                target.processes[group].name[1] = 111
+                target.processes[group].name[2] = 100
+                target.processes[group].name[3] = 101
+                target.processes[group].name[4] = 120
+            }
+            target.count += 1
+        } else {
+            target.processes[group].cpu_percent += entry.cpu_percent
+            target.processes[group].memory_bytes += entry.memory_bytes
+            target.processes[group].ticks += entry.ticks
+            target.processes[group].threads += entry.threads
+            target.processes[group].group_count += 1
+        }
+    }
+}
+
+// Reads the memory figures the Performance tab shows from /proc/meminfo text.
+#program_export
+ParseMemory :: (content: []u8) -> MemoryDetails {
+    details: MemoryDetails
+    details.total_kb = LineKb(content, "MemTotal:")
+    details.available_kb = LineKb(content, "MemAvailable:")
+    if details.available_kb < 0 { details.available_kb = LineKb(content, "MemFree:") }
+    cached := LineKb(content, "Cached:")
+    buffers := LineKb(content, "Buffers:")
+    details.cache_kb = -1
+    if cached >= 0 {
+        details.cache_kb = cached
+        if buffers > 0 { details.cache_kb += buffers }
+    }
+    details.commit_kb = LineKb(content, "Committed_AS:")
+    details.commit_limit_kb = LineKb(content, "CommitLimit:")
+    details.kernel_paged_kb = LineKb(content, "SReclaimable:")
+    details.kernel_nonpaged_kb = LineKb(content, "SUnreclaim:")
+    details.swap_total_kb = LineKb(content, "SwapTotal:")
+    details.swap_free_kb = LineKb(content, "SwapFree:")
+    return details
+}
+
+// Reads the kilobyte value of a /proc/meminfo entry, such as "MemTotal:". The
+// label must start a line, so "Cached:" never matches "SwapCached:".
 LineKb :: (content: []u8, label: string) -> s64 {
     limit := cast(s32)content.count
     label_count := cast(s32)label.count
     index: s32 = 0
     while index < limit {
+        if index > 0 && content[index - 1] != 10 {
+            index += 1
+            continue
+        }
         matched := true
         offset: s32 = 0
         while offset < label_count {
@@ -271,13 +533,23 @@ Refresh :: () {
     previous := *snapshots[active]
     target.count = 0
     target.cpu_percent = 0
+    target.kernel_percent = 0
     target.memory_used = 0
     target.memory_total = 0
     target.busy_ticks = 0
+    target.kernel_ticks = 0
     target.total_ticks = 0
+    target.threads = 0
+    target.handles = -1
+    target.memory = MemoryDetails.{}
+    target.gpu_percent = 0
+    target.gpu_count = 0
+    target.vram_used = 0
+    target.vram_total = 0
 
     stat_buffer: [8192]u8
     busy: u64 = 0
+    kernel_ticks: u64 = 0
     total_ticks: u64 = 0
     stat_length := ReadSmall("/proc/stat", stat_buffer[:])
     if stat_length > 0 {
@@ -285,13 +557,14 @@ Refresh :: () {
         if ok {
             busy = sample_busy
             total_ticks = sample_total
+            kernel_ticks = CpuKernelTicks(stat_buffer[0:stat_length])
         }
     }
     mem_length := ReadSmall("/proc/meminfo", stat_buffer[:])
     if mem_length > 0 {
-        total_kb := LineKb(stat_buffer[0:mem_length], "MemTotal:")
-        available_kb := LineKb(stat_buffer[0:mem_length], "MemAvailable:")
-        if available_kb < 0 { available_kb = LineKb(stat_buffer[0:mem_length], "MemFree:") }
+        target.memory = ParseMemory(stat_buffer[0:mem_length])
+        total_kb := target.memory.total_kb
+        available_kb := target.memory.available_kb
         if total_kb > 0 {
             target.memory_total = cast(u64)total_kb * 1024
             if available_kb >= 0 && available_kb <= total_kb {
@@ -300,7 +573,11 @@ Refresh :: () {
                 target.memory_used = target.memory_total
             }
         }
+        if target.memory.commit_kb > commit_peak_kb { commit_peak_kb = target.memory.commit_kb }
     }
+    handles_length := ReadSmall("/proc/sys/fs/file-nr", stat_buffer[:])
+    if handles_length > 0 { target.handles = FirstNumber(stat_buffer[0:handles_length]) }
+    ReadGpuStats(target)
 
     directory := Files.OpenDirectory("/proc")
     path_buffer: [64]u8
@@ -317,6 +594,7 @@ Refresh :: () {
         process.pid = pid
         if !ParseStat(stat_buffer[0:length], *process) { continue }
         process.cpu_percent = 0
+        process.group_count = 1
         found, previous_ticks := FindTicks(previous, pid)
         if found && process.ticks >= previous_ticks && total_ticks > previous.total_ticks {
             delta := cast(float64)(process.ticks - previous_ticks)
@@ -325,17 +603,96 @@ Refresh :: () {
         }
         target.processes[target.count] = process
         target.count += 1
+        if process.threads > 0 { target.threads += cast(s64)process.threads }
     }
     Files.CloseDirectory(*directory)
 
     target.busy_ticks = busy
+    target.kernel_ticks = kernel_ticks
     target.total_ticks = total_ticks
     if previous.total_ticks > 0 && total_ticks > previous.total_ticks && busy >= previous.busy_ticks {
         delta_busy := cast(float64)(busy - previous.busy_ticks)
         span := cast(float64)(total_ticks - previous.total_ticks)
         target.cpu_percent = 100.0 * delta_busy / span
+        if kernel_ticks >= previous.kernel_ticks {
+            target.kernel_percent = 100.0 * cast(float64)(kernel_ticks - previous.kernel_ticks) / span
+        }
     }
+    BuildGroupedSnapshot(target, *grouped_snapshot)
     active = 1 - active
+    // The first sample has no previous one to measure CPU time against.
+    if previous.total_ticks > 0 {
+        memory_percent: float64 = 0
+        if target.memory_total > 0 {
+            memory_percent = 100.0 * cast(float64)target.memory_used / cast(float64)target.memory_total
+        }
+        vram_percent: float64 = 0
+        if target.vram_total > 0 {
+            vram_percent = 100.0 * cast(float64)target.vram_used / cast(float64)target.vram_total
+        }
+        PushHistoryExtended(target.cpu_percent, target.kernel_percent, memory_percent,
+            target.gpu_percent, vram_percent)
+    }
+}
+
+ClampPercent :: (value: float64) -> float32 {
+    if value < 0.0 { return 0.0 }
+    if value > 100.0 { return 100.0 }
+    return cast(float32)value
+}
+
+#program_export
+PushHistory :: (cpu: float64, kernel: float64, memory: float64) {
+    PushHistoryExtended(cpu, kernel, memory, 0.0, 0.0)
+}
+
+#program_export
+PushHistoryExtended :: (cpu: float64, kernel: float64, memory: float64,
+    gpu: float64, vram: float64) {
+    cpu_history[history_next] = ClampPercent(cpu)
+    kernel_history[history_next] = ClampPercent(kernel)
+    memory_history[history_next] = ClampPercent(memory)
+    gpu_history[history_next] = ClampPercent(gpu)
+    vram_history[history_next] = ClampPercent(vram)
+    history_next = (history_next + 1) % HISTORY_LENGTH
+    if history_count < HISTORY_LENGTH { history_count += 1 }
+}
+
+// Copies one history, oldest first, into the last slots of OUTPUT and zeros
+// the slots before it, so a graph scrolls in from the right edge at a fixed
+// time scale. Returns the filled slice, at most HISTORY_LENGTH long.
+#program_export
+History :: (kind: s32, output: []float32) -> []float32 {
+    length: s32 = HISTORY_LENGTH
+    if length > cast(s32)output.count { length = cast(s32)output.count }
+    if length <= 0 { return output[0:0] }
+    for index: 0..length - 1 { output[index] = 0.0 }
+    shown := history_count
+    if shown > length { shown = length }
+    if shown > 0 {
+        for step: 0..shown - 1 {
+            slot := (history_next - shown + step + HISTORY_LENGTH) % HISTORY_LENGTH
+            value: float32 = cpu_history[slot]
+            if kind == HISTORY_KERNEL { value = kernel_history[slot] }
+            if kind == HISTORY_MEMORY { value = memory_history[slot] }
+            if kind == HISTORY_GPU { value = gpu_history[slot] }
+            if kind == HISTORY_VRAM { value = vram_history[slot] }
+            output[length - shown + step] = value
+        }
+    }
+    return output[0:length]
+}
+
+// Clock ticks per second, as /proc reports CPU time.
+#program_export
+ClockTicks :: () -> float64 {
+    EnsureTiming()
+    return clock_ticks
+}
+
+#program_export
+CommitPeakKb :: () -> s64 {
+    return commit_peak_kb
 }
 
 CompareName :: (left: []u8, right: []u8) -> s32 {
@@ -353,28 +710,28 @@ CompareName :: (left: []u8, right: []u8) -> s32 {
 CompareRows :: (snapshot: *Snapshot, left: s32, right: s32, column: s32) -> s32 {
     if left == right { return 0 }
     if left < 0 || right < 0 || left >= snapshot.count || right >= snapshot.count { return 0 }
-    if column == 0 {
+    if column == COLUMN_NAME {
         return CompareName(snapshot.processes[left].name[0:snapshot.processes[left].name_count],
             snapshot.processes[right].name[0:snapshot.processes[right].name_count])
     }
-    if column == 1 {
+    if column == COLUMN_PID {
         if snapshot.processes[left].pid < snapshot.processes[right].pid { return -1 }
         if snapshot.processes[left].pid > snapshot.processes[right].pid { return 1 }
         return 0
     }
-    if column == 2 {
+    if column == COLUMN_CPU {
         if snapshot.processes[left].cpu_percent < snapshot.processes[right].cpu_percent { return -1 }
         if snapshot.processes[left].cpu_percent > snapshot.processes[right].cpu_percent { return 1 }
         return 0
     }
-    if column == 3 {
-        if snapshot.processes[left].memory_bytes < snapshot.processes[right].memory_bytes { return -1 }
-        if snapshot.processes[left].memory_bytes > snapshot.processes[right].memory_bytes { return 1 }
+    if column == COLUMN_CPU_TIME {
+        if snapshot.processes[left].ticks < snapshot.processes[right].ticks { return -1 }
+        if snapshot.processes[left].ticks > snapshot.processes[right].ticks { return 1 }
         return 0
     }
-    if column == 4 {
-        if snapshot.processes[left].state < snapshot.processes[right].state { return -1 }
-        if snapshot.processes[left].state > snapshot.processes[right].state { return 1 }
+    if column == COLUMN_MEMORY {
+        if snapshot.processes[left].memory_bytes < snapshot.processes[right].memory_bytes { return -1 }
+        if snapshot.processes[left].memory_bytes > snapshot.processes[right].memory_bytes { return 1 }
         return 0
     }
     return 0
@@ -427,6 +784,101 @@ FormatBytes :: (value: u64, output: []u8) -> string {
         }
     }
     return TextView(output[0:length])
+}
+
+// Appends PIECE to OUTPUT at LENGTH and returns the new length.
+Append :: (output: []u8, length: s32, piece: string) -> s32 {
+    at := length
+    for byte: piece {
+        if at >= cast(s32)output.count { break }
+        output[at] = byte
+        at += 1
+    }
+    return at
+}
+
+// A kilobyte count with thousands separators, as "1,234,567". Negative values,
+// which mean the kernel did not report the figure, read as "n/a".
+#program_export
+FormatThousands :: (value: s64, output: []u8) -> string {
+    if value < 0 { return "n/a" }
+    digits: [32]u8
+    text := Number.FormatInteger(value, digits[:])
+    length: s32 = 0
+    count := cast(s32)text.count
+    for index: 0..count - 1 {
+        if index > 0 && (count - index) % 3 == 0 && length < cast(s32)output.count {
+            output[length] = 44
+            length += 1
+        }
+        if length < cast(s32)output.count {
+            output[length] = text[index]
+            length += 1
+        }
+    }
+    return TextView(output[0:length])
+}
+
+// Resident memory in the Mem Usage column style: "12,345 K".
+#program_export
+FormatKilobytes :: (bytes: u64, output: []u8) -> string {
+    number: [32]u8
+    text := FormatThousands(cast(s64)(bytes / 1024), number[:])
+    length := Append(output, 0, text)
+    length = Append(output, length, " K")
+    return TextView(output[0:length])
+}
+
+// CPU time from clock ticks as H:MM:SS.
+#program_export
+FormatCpuTime :: (ticks: u64, output: []u8) -> string {
+    EnsureTiming()
+    seconds := cast(s64)(cast(float64)ticks / clock_ticks)
+    hours := seconds / 3600
+    minutes := (seconds / 60) % 60
+    rest := seconds % 60
+    digits: [24]u8
+    length := Append(output, 0, Number.FormatInteger(hours, digits[:]))
+    length = Append(output, length, ":")
+    if minutes < 10 { length = Append(output, length, "0") }
+    length = Append(output, length, Number.FormatInteger(minutes, digits[:]))
+    length = Append(output, length, ":")
+    if rest < 10 { length = Append(output, length, "0") }
+    length = Append(output, length, Number.FormatInteger(rest, digits[:]))
+    return TextView(output[0:length])
+}
+
+// A CPU share as a whole percentage with at least two digits, as "07".
+#program_export
+FormatCpu :: (percent: float64, output: []u8) -> string {
+    value := cast(s64)(percent + 0.5)
+    if value < 0 { value = 0 }
+    if value > 100 { value = 100 }
+    digits: [8]u8
+    length: s32 = 0
+    if value < 10 { length = Append(output, length, "0") }
+    length = Append(output, length, Number.FormatInteger(value, digits[:]))
+    return TextView(output[0:length])
+}
+
+// Starts COMMAND through /bin/sh in the background, detached from taskmgr's
+// standard streams, as the Run dialog does. False when the command is empty,
+// too long, or the shell could not be started.
+#program_export
+StartTask :: (command: string) -> bool {
+    has_text := false
+    for byte: command {
+        if byte != 32 && byte != 9 { has_text = true }
+        if byte == 0 { return false }
+    }
+    if !has_text { return false }
+    line: [COMMAND_CAPACITY + 64]u8
+    length := Append(line[:], 0, "(")
+    length = Append(line[:], length, command)
+    length = Append(line[:], length, ") </dev/null >/dev/null 2>&1 &")
+    if length >= cast(s32)line.count - 1 || cast(s32)command.count > COMMAND_CAPACITY { return false }
+    line[length] = 0
+    return RunShell(*line[0]) == 0
 }
 
 // Sends SIGTERM; false when the kernel reports the request could not be made.

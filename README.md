@@ -6,11 +6,29 @@ memory, plus total CPU and memory usage.
 
 ## Interface
 
-- Sortable process table (Name, PID, CPU %, Memory, State) from the DataViews
-  `TableView` widget; click a header to change the sort.
-- Total CPU and memory bars, with a per-second automatic refresh.
-- `Refresh now` resamples immediately; `End Task` sends SIGTERM to the
-  selected process.
+The window keeps the compact structure of the Windows 2000 Task Manager while
+installing the current Linux desktop palette for its controls: menu bar,
+Applications / Processes / Performance tabs, bordered content and a three-pane
+status bar.
+
+- **Applications** lists top-level EWMH windows and can switch to one, request
+  that it close, or open a new command.
+- **Processes** is a sortable DataViews table with image name, PID, CPU, CPU
+  time and resident memory. Rows are grouped by image name by default, with all
+  Codex-family processes combined under `codex`; Options → Group Processes
+  toggles the grouping. Selecting any cell highlights the complete row.
+  `End Process` sends SIGTERM after an optional warning for ungrouped rows.
+- **Performance** shows 60-sample CPU, memory, GPU and VRAM histories as clean
+  green lines on black, plus process, thread, handle, physical-memory, commit
+  and kernel-memory totals. GPU counters come from standard Linux DRM sysfs and
+  display `n/a` when the driver does not expose them.
+- File, Options, View and Help menus provide Run, refresh speed, manual refresh,
+  kernel-time display, process grouping, end-process confirmation and About
+  actions.
+
+The model refreshes once a second by default and reads `/proc` directly.
+`TASKMGR_TAB=applications|processes|performance` selects the initial tab, which
+is useful for headless rendering and tests.
 
 ## Build and run
 
@@ -18,9 +36,13 @@ memory, plus total CPU and memory usage.
 make            # ziran tool kryon build
 make run        # open the desktop window
 make test       # native model tests (no display needed)
+make x11-test   # native app and Applications actions on a private Xvfb display
 make shot       # render one frame to build/taskmgr.ppm
 make check      # compile every module
 ```
+
+`make x11-test` never touches the current desktop. It needs `Xvfb`, `xfwm4`
+(or `X11_TEST_WM`), `xterm` and `xprop`; when one is absent it reports a skip.
 
 The desktop profile opens an SDL2 window through Kryon's `desktop` backend.
 The `tui`, `web`, `portable`, and headless `shot` profiles use the same

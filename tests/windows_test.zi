@@ -1,0 +1,70 @@
+using Apps :: #import "windows";
+
+test_libc :: #system_library "libc";
+TestSleep :: (micros: u32) -> s32 #foreign test_libc "usleep";
+
+PROBE_TITLE :: "taskmgr-probe";
+
+list: Apps.AppList;
+
+FindProbe :: () -> s32 {
+    if list.count <= 0 { return -1 }
+    for index: 0..list.count - 1 {
+        entry := *list.windows[index]
+        if TextView(entry.title[0:entry.title_count]) == PROBE_TITLE { return index }
+    }
+    return -1
+}
+
+// Runs only on the private display scripts/x11-test.sh starts: an EWMH window
+// manager with one xterm titled taskmgr-probe. It lists the windows, asks the
+// manager to activate the probe, then to close it, and waits for it to go.
+main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 1 {
+        print("usage: windows_test\n")
+        return 64
+    }
+    found: s32 = -1
+    waited: s32 = 0
+    while waited < 50 && found < 0 {
+        Apps.AppsRefresh(*list)
+        found = FindProbe()
+        if found < 0 {
+            unused TestSleep(100000)
+            waited += 1
+        }
+    }
+    if !list.available {
+        print("windows: no window manager client list\n")
+        return 65
+    }
+    if found < 0 {
+        print("windows: probe window not listed\n")
+        return 66
+    }
+    probe := list.windows[found]
+    if probe.pid <= 0 {
+        print("windows: probe window has no process id\n")
+        return 67
+    }
+    if !Apps.AppsSwitchTo(probe.id) {
+        print("windows: switch request failed\n")
+        return 68
+    }
+    if !Apps.AppsCloseWindow(probe.id) {
+        print("windows: close request failed\n")
+        return 69
+    }
+    waited = 0
+    while waited < 50 {
+        unused TestSleep(100000)
+        Apps.AppsRefresh(*list)
+        if FindProbe() < 0 {
+            print("taskmgr window tests passed\n")
+            return 0
+        }
+        waited += 1
+    }
+    print("windows: probe window did not close\n")
+    return 70
+}

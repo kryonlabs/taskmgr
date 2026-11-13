@@ -1,7 +1,7 @@
 ZIRAN ?= ./scripts/ziran.sh
 SOURCES := $(wildcard src/*.zi) $(wildcard tests/*.zi) ziran.toml ziran.lock scripts/ziran.sh Makefile
 
-.PHONY: all build run check test shot clean
+.PHONY: all build run check test x11-test shot clean
 
 all: build
 
@@ -20,6 +20,14 @@ build/model-test: $(SOURCES)
 
 test: build/model-test
 	./build/model-test
+
+build/windows-test: $(SOURCES)
+	$(ZIRAN) build --project --target=c --exe --entry windows_test:main -o build/windows-test-c tests/windows_test.zi
+	cp build/windows-test-c/windows_test build/windows-test
+
+# Applications-tab integration on a scrubbed private Xvfb display.
+x11-test: build build/windows-test
+	./scripts/x11-test.sh
 
 # One rendered frame without a display; useful for interface checks.
 shot: build
