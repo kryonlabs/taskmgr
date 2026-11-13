@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Reduced the native desktop working set from roughly 148 MB to below 30 MiB
+  by updating Kryon to its software pixel-presenter path, bounding process and
+  cell storage, and using a compact resizable native surface.
+- Added a private-Xvfb RSS regression that measures the steady application
+  after multiple process refreshes and enforces the 30 MiB limit.
+- System-theme colors now cover the whole page, tabs, process panel and status
+  panes instead of leaving mixed hard-coded white surfaces.
+
 ## [0.1.1] - 2026-11-12
 
 ### Changed

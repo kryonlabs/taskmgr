@@ -17,12 +17,6 @@ for tool in Xvfb "$window_manager" xterm xprop; do
     fi
 done
 
-# The first free display number from 90 up.
-number=90
-while [ -e "/tmp/.X11-unix/X$number" ] || [ -e "/tmp/.X$number-lock" ]; do
-    number=$((number + 1))
-done
-
 mkdir -p "$root/build"
 scratch=$(mktemp -d "$root/build/x11-test.XXXXXX")
 pids=
@@ -45,19 +39,38 @@ run() {
         HARMONY_DESKTOP_RECOVERY=0 "$@"
 }
 
-env -i PATH="$PATH" HOME="$scratch" HARMONY_DESKTOP_RECOVERY=0 \
-    Xvfb ":$number" -screen 0 1024x720x24 -nolisten tcp -noreset \
-    >"$scratch/xvfb.log" 2>&1 &
-pids="$!"
-waited=0
-until [ -e "/tmp/.X11-unix/X$number" ]; do
-    waited=$((waited + 1))
-    if [ "$waited" -gt 50 ]; then
-        echo 'x11-test: private Xvfb did not start' >&2
-        exit 1
-    fi
-    sleep 0.1
+start=$((120 + ($$ % 100)))
+number=
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+    candidate=$((120 + ((start - 120 + attempt) % 100)))
+    env -i PATH="$PATH" HOME="$scratch" HARMONY_DESKTOP_RECOVERY=0 \
+        Xvfb ":$candidate" -screen 0 1024x720x24 -nolisten tcp -noreset \
+        >"$scratch/xvfb.log" 2>&1 &
+    candidate_pid=$!
+    waited=0
+    while kill -0 "$candidate_pid" 2>/dev/null && [ "$waited" -lt 40 ]; do
+        if [ -S "/tmp/.X11-unix/X$candidate" ]; then
+            sleep 0.1
+            if kill -0 "$candidate_pid" 2>/dev/null; then
+                number=$candidate
+                pids=$candidate_pid
+                break
+            fi
+        fi
+        waited=$((waited + 1))
+        sleep 0.1
+    done
+    if [ -n "$number" ]; then break; fi
+    kill "$candidate_pid" 2>/dev/null || true
+    wait "$candidate_pid" 2>/dev/null || true
+    attempt=$((attempt + 1))
 done
+if [ -z "$number" ]; then
+    echo 'x11-test: private Xvfb did not start on displays 120-219' >&2
+    sed -n '1,120p' "$scratch/xvfb.log" >&2
+    exit 1
+fi
 
 run "$window_manager" >"$scratch/wm.log" 2>&1 &
 wm_pid=$!

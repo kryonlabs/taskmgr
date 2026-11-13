@@ -4,7 +4,7 @@ ZIRAN ?= ./scripts/ziran.sh
 export LDLIBS += -lX11
 SOURCES := $(wildcard src/*.zi) $(wildcard tests/*.zi) ziran.toml ziran.lock scripts/ziran.sh Makefile
 
-.PHONY: all build run check test x11-test shot clean
+.PHONY: all build run check test x11-test memory-test shot clean
 
 all: build
 
@@ -31,6 +31,10 @@ build/windows-test: $(SOURCES)
 # Applications-tab integration on a scrubbed private Xvfb display.
 x11-test: build build/windows-test
 	./scripts/x11-test.sh
+
+# Native RSS regression on a scrubbed private Xvfb display.
+memory-test: build
+	./scripts/memory-test.sh
 
 # One rendered frame without a display; useful for interface checks.
 shot: build

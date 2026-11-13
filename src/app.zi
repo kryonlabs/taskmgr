@@ -64,10 +64,14 @@ PAD :: 10.0;
 
 COLUMNS :: Model.COLUMNS;
 APP_COLUMNS :: 2;
-CELL_WIDTH :: 24;
-NAME_WIDTH :: 64;
+// Ten-digit PIDs, percentages, elapsed times and adaptive byte values fit in
+// 16 bytes; process/group names use the model's bounded 32-byte capacity.
+CELL_WIDTH :: 16;
+NAME_WIDTH :: Model.NAME_CAPACITY;
 STATUS_WIDTH :: 160;
-MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES * 2;
+// A flattened grouped table contains every raw process plus at most one header
+// per two members: singleton groups use their raw row directly.
+MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES + Model.MAX_PROCESSES / 2;
 
 process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Memory"};
 process_fractions: [5]float32 = .{0.40, 0.12, 0.10, 0.16, 0.22};
@@ -171,9 +175,17 @@ typed: [64]u8;
 // display strings into frame locals every frame.
 status_bytes: [STATUS_WIDTH]u8;
 status_length: s32;
+palette_background: u32;
+palette_base: u32;
+palette_text: u32;
+palette_border: u32;
 
 Color32 :: (packed: u32) -> Color {
     return ColorFromPacked(packed)
+}
+
+PaletteLayer :: (opacity: u32) -> u32 {
+    return Theme.StateLayer(palette_background, palette_text, opacity)
 }
 
 Inset :: (bounds: Rectangle, amount: float32) -> Rectangle {
@@ -1058,8 +1070,8 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
 StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
     theme := Theme.CurrentTheme()
     snapshot := Model.Current()
-    Box(session, BoxProps.{.key = 500, .bounds = bounds, .fill = Color32(theme.colors.surface),
-        .border = Color32(theme.colors.subtle_border)})
+    Box(session, BoxProps.{.key = 500, .bounds = bounds, .fill = Color32(PaletteLayer(5)),
+        .border = Color32(palette_border)})
     count_line: [16]u8
     processes_line: [48]u8
     processes_parts: [2]string = .{"Processes: ", Number.FormatInteger(cast(s64)snapshot.count, count_line[:])}
@@ -1079,7 +1091,7 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
         width := (bounds.width - 16.0) * widths[index]
         pane := Rectangle.{x, bounds.y + 3.0, width, bounds.height - 6.0}
         Box(session, BoxProps.{.key = cast(u64)(501 + cast(s32)index * 2), .bounds = pane,
-            .fill = Color32(theme.colors.surface_sunken), .border = Color32(theme.colors.subtle_border),
+            .fill = Color32(palette_background), .border = Color32(palette_border),
             .radius = theme.metrics.radius_mark})
         Label(session, 502 + cast(s32)index * 2, texts[index], .{pane.x + 6.0, pane.y + 2.0, pane.width - 12.0,
             pane.height - 4.0}, font)
@@ -1087,11 +1099,35 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
     }
 }
 
+TaskTabs :: (session: Session, bounds: Rectangle) {
+    labels: [3]string = .{"Applications", "Processes", "Performance"}
+    gap: float32 = 4.0
+    width := (bounds.width - gap * 2.0) / 3.0
+    for index: 0..2 {
+        if TaskButton(session, 50 + cast(s32)index, labels[index],
+            .{bounds.x + cast(float32)index * (width + gap), bounds.y, width, bounds.height},
+            current_tab == index, false) {
+            current_tab = cast(s32)index
+        }
+    }
+}
+
 #program_export
 Frame :: (session: Session, viewport: Rectangle) -> s32 {
     if !started {
         unused ThemeXInitThreads()
-        unused SystemTheme.SystemPaletteInstall(SystemThemeHostLinux.SystemPaletteRead())
+        palette := SystemThemeHostLinux.SystemPaletteRead()
+        // Some GTK/host themes report the window background correctly but
+        // return a white input "base" and an inconsistent darkness flag.
+        // Task Manager is a single system panel, so keep its panel base on the
+        // actual system window background. Text, borders and selection still
+        // come from the rest of the system palette.
+        palette.base = palette.background
+        palette_background = palette.background
+        palette_base = palette.base
+        palette_text = palette.text
+        palette_border = palette.border
+        unused SystemTheme.SystemPaletteInstall(palette)
         current_tab = StartingTab()
         started = true
     }
@@ -1123,24 +1159,17 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
     small := FontSize(*page, 13)
     theme := Theme.CurrentTheme()
 
-    Box(session, BoxProps.{.key = 1, .bounds = viewport, .fill = Color32(theme.colors.background)})
+    Box(session, BoxProps.{.key = 1, .bounds = viewport, .fill = Color32(palette_background)})
 
     tabs_y := viewport.y + MENU_HEIGHT + 6.0
-    tabs: [3]Tab
-    tabs[0].label = "Applications"
-    tabs[1].label = "Processes"
-    tabs[2].label = "Performance"
-    tab_result := TabBar(session, TabBarProps.{.key = 40, .bounds = .{viewport.x + 8.0, tabs_y,
-        viewport.width - 16.0, TAB_HEIGHT}, .selected_index = current_tab, .content_sized = true},
-        tabs[:])
-    current_tab = tab_result.selected_index
+    TaskTabs(session, .{viewport.x + 8.0, tabs_y, viewport.width - 16.0, TAB_HEIGHT})
 
     status_y := viewport.y + viewport.height - STATUS_HEIGHT
     panel_y := tabs_y + TAB_HEIGHT
     panel := Rectangle.{viewport.x + 8.0, panel_y, viewport.width - 16.0, status_y - panel_y - 6.0}
     if panel.height < 80.0 { panel.height = 80.0 }
-    Box(session, BoxProps.{.key = 41, .bounds = panel, .fill = Color32(theme.colors.surface),
-        .border = Color32(theme.colors.border), .radius = theme.metrics.radius_small})
+    Box(session, BoxProps.{.key = 41, .bounds = panel, .fill = Color32(PaletteLayer(3)),
+        .border = Color32(palette_border), .radius = theme.metrics.radius_small})
     content := Inset(panel, PAD)
     ColumnWidths(content.width)
     if current_tab == TAB_APPLICATIONS {

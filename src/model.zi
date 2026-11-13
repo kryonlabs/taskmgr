@@ -19,8 +19,12 @@ STOP_SIGNAL :: 15; // SIGTERM
 // Keep the fixed snapshot bounded, but large enough for development hosts and
 // servers with several thousand visible processes. A lower cap silently hid
 // rows (including taskmgr's own test process) once /proc exceeded 1,024 PIDs.
-MAX_PROCESSES :: 8192;
-NAME_CAPACITY :: 64;
+// Four thousand entries retain that headroom without reserving the much larger
+// table and text generations an 8,192-entry snapshot required.
+MAX_PROCESSES :: 4096;
+// Linux TASK_COMM_LEN is 16 including the terminator. Keep extra room for
+// synthetic group labels without doubling every process snapshot row.
+NAME_CAPACITY :: 32;
 COLUMNS :: 5;
 COMMAND_CAPACITY :: 1024;
 

@@ -31,6 +31,7 @@ entry = "src/app.zi"
 
 [tool.kryon.profiles.desktop]
 backend = "desktop"
+host = "src/desktop_host.zi"
 
 [tool.kryon.profiles.portable]
 backend = "desktop"

@@ -34,6 +34,12 @@ The model refreshes once a second by default and reads `/proc` directly.
 `TASKMGR_TAB=applications|processes|performance` selects the initial tab, which
 is useful for headless rendering and tests.
 
+The native window starts at a compact, resizable 400 × 480 size. Kryon's
+software pixel presenter is the default because taskmgr already rasterizes its
+widgets on the CPU; this avoids loading Mesa's LLVM/Gallium stack just to copy
+that finished frame. Set `KRYON_PIXMAP_GPU=1` before launch to opt into GPU
+presentation when that tradeoff is useful.
+
 ## Build and run
 
 ```sh
@@ -41,12 +47,15 @@ make            # ziran tool kryon build
 make run        # open the desktop window
 make test       # native model tests (no display needed)
 make x11-test   # native app and Applications actions on a private Xvfb display
+make memory-test # steady native RSS on private Xvfb; must stay below 30 MiB
 make shot       # render one frame to build/taskmgr.ppm
 make check      # compile every module
 ```
 
 `make x11-test` never touches the current desktop. It needs `Xvfb`, `xfwm4`
 (or `X11_TEST_WM`), `xterm` and `xprop`; when one is absent it reports a skip.
+`make memory-test` likewise uses only a scrubbed private Xvfb display, waits for
+several process and retained-text refreshes, then enforces a 30 MiB RSS cap.
 
 The desktop profile opens an SDL2 window through Kryon's `desktop` backend.
 The `tui`, `web`, `portable`, and headless `shot` profiles use the same

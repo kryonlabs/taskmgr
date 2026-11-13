@@ -1,0 +1,17 @@
+// Compact native host for the classic task-manager layout. Keeping the
+// initial surface at its useful size avoids allocating 960x600 Cairo, SDL and
+// X11 framebuffers merely to show a deliberately compact system utility.
+#import "kryon/desktop_loop";
+using Kryon :: #import "kryon/Kryon";
+App :: #import "app";
+
+// Custom hosts currently provide the bridge symbol consumed by desktop_loop.
+#program_export
+ProjectFrame :: (session: Session, viewport: Rectangle) -> s32 {
+    return App.Frame(session, viewport)
+}
+
+#program_export
+main :: () -> s32 {
+    return RunDesktop(400, 480)
+}
