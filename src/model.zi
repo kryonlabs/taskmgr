@@ -796,6 +796,15 @@ MAX_TREE_DEPTH :: 64;
 // represents (-1 for none). Rebuilt by AppUsages; never retained across calls.
 pid_order: [MAX_PROCESSES]s32;
 owner_slot: [MAX_PROCESSES]s32;
+// The window slot each snapshot process counts toward (-1 for none), as of
+// the last AppUsages call.
+process_owner: [MAX_PROCESSES]s32;
+
+#program_export
+ProcessOwner :: (snapshot: *Snapshot, index: s32) -> s32 {
+    if index < 0 || index >= snapshot.count { return -1 }
+    return process_owner[index]
+}
 
 // /proc lists PIDs in ascending order, so this insertion sort is linear in
 // practice and still correct when the order differs.
@@ -868,6 +877,7 @@ AppUsages :: (snapshot: *Snapshot, window_pids: []s32, gpu_pids: []s32,
             cursor = IndexOfPid(snapshot, parent)
             depth += 1
         }
+        process_owner[index] = slot
         if slot < 0 { continue }
         process := *snapshot.processes[index]
         usage := *output[slot]
@@ -1307,16 +1317,21 @@ FormatCpuTime :: (ticks: u64, output: []u8) -> string {
     return TextView(output[0:length])
 }
 
-// A CPU share as a whole percentage with at least two digits, as "07".
+// A share of the whole machine: one decimal below 10% ("0.4", "7.2") so light
+// use on a many-core CPU does not read as zero, whole percent above ("43").
 #program_export
 FormatCpu :: (percent: float64, output: []u8) -> string {
-    value := cast(s64)(percent + 0.5)
-    if value < 0 { value = 0 }
-    if value > 100 { value = 100 }
+    tenths := cast(s64)(percent * 10.0 + 0.5)
+    if tenths < 0 { tenths = 0 }
+    if tenths > 1000 { tenths = 1000 }
     digits: [8]u8
-    length: s32 = 0
-    if value < 10 { length = Append(output, length, "0") }
-    length = Append(output, length, Number.FormatInteger(value, digits[:]))
+    if tenths >= 100 {
+        whole := Append(output, 0, Number.FormatInteger((tenths + 5) / 10, digits[:]))
+        return TextView(output[0:whole])
+    }
+    length := Append(output, 0, Number.FormatInteger(tenths / 10, digits[:]))
+    length = Append(output, length, ".")
+    length = Append(output, length, Number.FormatInteger(tenths % 10, digits[:]))
     return TextView(output[0:length])
 }
 

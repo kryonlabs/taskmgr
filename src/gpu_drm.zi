@@ -1,0 +1,344 @@
+// Per-process GPU shares from DRM fdinfo, the kernel's standard per-client
+// counters (amdgpu, i915, xe, msm, panfrost and others). Every open DRM file
+// reports busy time per engine, either drm-engine-NAME in nanoseconds (shared
+// by drm-engine-capacity-NAME instances) or drm-cycles-NAME against
+// drm-total-cycles-NAME. A client's share is its busiest engine since the
+// previous sample, and a client counts once even when several descriptors or
+// processes hold it. NVIDIA's proprietary driver publishes no such counters;
+// gpu_processes.zi covers it through NVML.
+Files :: #import "std/file";
+Number :: #import "std/number_text";
+Timer :: #import "std/timer_linux";
+Gpu :: #import "gpu_processes";
+
+MAX_FDINFO_ENGINES :: 16;
+
+FdinfoClient :: struct {
+    client: u64
+    device: u64
+    engines: [MAX_FDINFO_ENGINES]u64
+    busy: [MAX_FDINFO_ENGINES]u64
+    total: [MAX_FDINFO_ENGINES]u64
+    capacity: [MAX_FDINFO_ENGINES]u64
+    count: s32
+    has_client: bool
+}
+
+#scope_file
+
+c :: #system_library "c";
+ReadLinkRaw :: (path: *u8, output: *u8, size: usize) -> isize #foreign c "readlink";
+
+MAX_COUNTERS :: 1024;
+MAX_SEEN :: 512;
+
+// One engine of one client as of the previous sample.
+Counter :: struct {
+    client: u64
+    device: u64
+    engine: u64
+    busy: u64
+    total: u64
+    live: bool
+}
+
+counters: [MAX_COUNTERS]Counter;
+counter_count: s32;
+seen_clients: [MAX_SEEN]u64;
+seen_devices: [MAX_SEEN]u64;
+seen_count: s32;
+previous_ms: s64 = -1;
+found_any: bool;
+shares: Gpu.GpuShares;
+fdinfo_text: [4096]u8;
+
+Hash :: (text: []u8) -> u64 {
+    value: u64 = 14695981039346656037
+    for byte: text {
+        value = (value ^ cast(u64)byte) * 1099511628211
+    }
+    return value
+}
+
+StartsWith :: (line: []u8, prefix: string) -> bool {
+    if line.count < prefix.count { return false }
+    for index: 0..cast(s32)prefix.count - 1 {
+        if line[index] != prefix[index] { return false }
+    }
+    return true
+}
+
+// The first decimal number after the colon, or -1.
+LineNumber :: (line: []u8) -> s64 {
+    cursor: s32 = 0
+    total := cast(s32)line.count
+    while cursor < total && line[cursor] != 58 { cursor += 1 }
+    while cursor < total && (line[cursor] < 48 || line[cursor] > 57) { cursor += 1 }
+    if cursor >= total { return -1 }
+    value: s64 = 0
+    while cursor < total && line[cursor] >= 48 && line[cursor] <= 57 {
+        value = value * 10 + cast(s64)(line[cursor] - 48)
+        cursor += 1
+    }
+    return value
+}
+
+// The engine name between PREFIX and the colon.
+EngineName :: (line: []u8, prefix: string) -> []u8 {
+    end := cast(s32)prefix.count
+    while end < cast(s32)line.count && line[end] != 58 { end += 1 }
+    return line[prefix.count:end]
+}
+
+EngineSlot :: (reading: *FdinfoClient, name: []u8) -> s32 {
+    key := Hash(name)
+    if reading.count > 0 {
+        for index: 0..reading.count - 1 {
+            if reading.engines[index] == key { return index }
+        }
+    }
+    if reading.count >= MAX_FDINFO_ENGINES { return -1 }
+    slot := reading.count
+    reading.engines[slot] = key
+    reading.busy[slot] = 0
+    reading.total[slot] = 0
+    reading.capacity[slot] = 1
+    reading.count += 1
+    return slot
+}
+
+ParseLine :: (line: []u8, reading: *FdinfoClient) {
+    if StartsWith(line, "drm-client-id:") {
+        value := LineNumber(line)
+        if value >= 0 {
+            reading.client = cast(u64)value
+            reading.has_client = true
+        }
+        return
+    }
+    if StartsWith(line, "drm-pdev:") {
+        reading.device = Hash(line)
+        return
+    }
+    prefixes: [4]string = .["drm-engine-capacity-", "drm-engine-", "drm-total-cycles-", "drm-cycles-"]
+    for kind: 0..3 {
+        prefix := prefixes[kind]
+        if !StartsWith(line, prefix) { continue }
+        value := LineNumber(line)
+        slot := EngineSlot(reading, EngineName(line, prefix))
+        if value < 0 || slot < 0 { return }
+        if kind == 0 { reading.capacity[slot] = cast(u64)value }
+        if kind == 1 || kind == 3 { reading.busy[slot] = cast(u64)value }
+        if kind == 2 { reading.total[slot] = cast(u64)value }
+        return
+    }
+}
+
+AppendText :: (output: []u8, at: s32, piece: string) -> s32 {
+    length := at
+    for byte: piece {
+        if length >= cast(s32)output.count - 1 { break }
+        output[length] = byte
+        length += 1
+    }
+    return length
+}
+
+// "/proc/PID/KIND/NAME" as a NUL-terminated path; the string excludes NUL.
+ProcPath :: (pid: s32, kind: string, name: string, output: []u8) -> string {
+    digits: [16]u8
+    length := AppendText(output, 0, "/proc/")
+    length = AppendText(output, length, Number.FormatInteger(cast(s64)pid, digits[:]))
+    length = AppendText(output, length, kind)
+    if name.count > 0 {
+        length = AppendText(output, length, "/")
+        length = AppendText(output, length, name)
+    }
+    output[length] = 0
+    return TextView(output[0:length])
+}
+
+IsDrmDescriptor :: (path: *u8) -> bool {
+    target: [64]u8
+    length := ReadLinkRaw(path, *target[0], 63)
+    if length < 9 { return false }
+    return StartsWith(target[0:cast(s32)length], "/dev/dri/")
+}
+
+ReadFdinfo :: (path: string, reading: *FdinfoClient) -> bool {
+    file := Files.OpenRead(path)
+    if !file.valid { return false }
+    total: s32 = 0
+    while total < cast(s32)fdinfo_text.count {
+        count := Files.ReadAt(file, fdinfo_text[total:fdinfo_text.count], cast(s64)total)
+        if count <= 0 { break }
+        total += cast(s32)count
+    }
+    unused Files.CloseFile(file)
+    return ParseFdinfo(fdinfo_text[0:total], reading)
+}
+
+// Takes the client once per sample; false when another descriptor or
+// process already counted it.
+ClaimClient :: (reading: *FdinfoClient) -> bool {
+    if seen_count > 0 {
+        for index: 0..seen_count - 1 {
+            if seen_clients[index] == reading.client && seen_devices[index] == reading.device {
+                return false
+            }
+        }
+    }
+    if seen_count >= MAX_SEEN { return false }
+    seen_clients[seen_count] = reading.client
+    seen_devices[seen_count] = reading.device
+    seen_count += 1
+    return true
+}
+
+// Updates the stored counters and returns the client's busiest engine since
+// the previous sample, or -1 when this is its first sample.
+ClientPercent :: (reading: *FdinfoClient, elapsed_ms: s64) -> float64 {
+    best: float64 = -1.0
+    if reading.count <= 0 { return best }
+    for engine: 0..reading.count - 1 {
+        key := reading.engines[engine]
+        found: s32 = -1
+        if counter_count > 0 {
+            for index: 0..counter_count - 1 {
+                entry := *counters[index]
+                if entry.client == reading.client && entry.device == reading.device && entry.engine == key {
+                    found = index
+                    break
+                }
+            }
+        }
+        if found >= 0 {
+            entry := *counters[found]
+            percent := EnginePercent(entry.busy, reading.busy[engine], entry.total,
+                reading.total[engine], elapsed_ms, reading.capacity[engine])
+            if percent > best { best = percent }
+        } else if counter_count < MAX_COUNTERS {
+            found = counter_count
+            counter_count += 1
+        }
+        if found >= 0 {
+            entry := *counters[found]
+            entry.client = reading.client
+            entry.device = reading.device
+            entry.engine = key
+            entry.busy = reading.busy[engine]
+            entry.total = reading.total[engine]
+            entry.live = true
+        }
+    }
+    return best
+}
+
+AddShare :: (pid: s32, percent: float64) {
+    if shares.count >= Gpu.MAX_GPU_PROCESSES { return }
+    shares.pids[shares.count] = pid
+    shares.percent[shares.count] = percent
+    shares.count += 1
+}
+
+SampleProcess :: (pid: s32, elapsed_ms: s64) {
+    directory_path: [64]u8
+    directory := Files.OpenDirectory(ProcPath(pid, "/fd", "", directory_path[:]))
+    descriptor_path: [96]u8
+    info_path: [96]u8
+    while true {
+        entry := Files.NextDirectoryEntry(*directory)
+        if !entry.valid { break }
+        name := TextView(entry.name[0:entry.name_count])
+        if name == "." || name == ".." { continue }
+        unused ProcPath(pid, "/fd", name, descriptor_path[:])
+        if !IsDrmDescriptor(*descriptor_path[0]) { continue }
+        reading: FdinfoClient
+        if !ReadFdinfo(ProcPath(pid, "/fdinfo", name, info_path[:]), *reading) { continue }
+        found_any = true
+        if !ClaimClient(*reading) { continue }
+        percent := ClientPercent(*reading, elapsed_ms)
+        if percent >= 0.0 && elapsed_ms > 0 { AddShare(pid, percent) }
+    }
+    Files.CloseDirectory(*directory)
+}
+
+#scope_export
+
+// Parses one DRM fdinfo file; false unless it names a client with engines.
+#program_export
+ParseFdinfo :: (text: []u8, reading: *FdinfoClient) -> bool {
+    start: s32 = 0
+    total := cast(s32)text.count
+    while start < total {
+        end := start
+        while end < total && text[end] != 10 { end += 1 }
+        ParseLine(text[start:end], reading)
+        start = end + 1
+    }
+    return reading.has_client && reading.count > 0
+}
+
+// Busy percent of one engine between two samples: cycle counters against
+// their own total, nanosecond counters against wall time and capacity.
+#program_export
+EnginePercent :: (busy_before: u64, busy_now: u64, total_before: u64, total_now: u64,
+    elapsed_ms: s64, capacity: u64) -> float64 {
+    if busy_now < busy_before { return 0.0 }
+    busy := cast(float64)(busy_now - busy_before)
+    percent: float64 = 0.0
+    if total_now > 0 {
+        if total_now <= total_before { return 0.0 }
+        percent = 100.0 * busy / cast(float64)(total_now - total_before)
+    } else {
+        if elapsed_ms <= 0 { return 0.0 }
+        lanes := capacity
+        if lanes == 0 { lanes = 1 }
+        percent = 100.0 * busy / (cast(float64)elapsed_ms * 1000000.0 * cast(float64)lanes)
+    }
+    if percent > 100.0 { percent = 100.0 }
+    return percent
+}
+
+// Samples the DRM clients of PIDS; the first call only records counters.
+#program_export
+DrmSample :: (pids: []s32) {
+    now := Timer.MonotonicMilliseconds()
+    elapsed: s64 = 0
+    if previous_ms >= 0 && now > previous_ms { elapsed = now - previous_ms }
+    shares.count = 0
+    seen_count = 0
+    if counter_count > 0 {
+        for index: 0..counter_count - 1 { counters[index].live = false }
+    }
+    for pid: pids { SampleProcess(pid, elapsed) }
+    // Drop counters of clients that closed.
+    kept: s32 = 0
+    if counter_count > 0 {
+        for index: 0..counter_count - 1 {
+            if counters[index].live {
+                counters[kept] = counters[index]
+                kept += 1
+            }
+        }
+    }
+    counter_count = kept
+    previous_ms = now
+}
+
+// True once any DRM client with engine counters was seen in this run.
+#program_export
+DrmAvailable :: () -> bool { return found_any }
+
+#program_export
+DrmShares :: () -> *Gpu.GpuShares { return *shares }
+
+// Forgets every counter, so the next sample starts fresh; for tests and for
+// reopening the tab after a pause.
+#program_export
+DrmReset :: () {
+    counter_count = 0
+    seen_count = 0
+    previous_ms = -1
+    shares.count = 0
+}

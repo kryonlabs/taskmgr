@@ -2,6 +2,7 @@ using UI :: #import "Widgets";
 using Model :: #import "model";
 Apps :: #import "windows";
 Gpu :: #import "gpu_processes";
+GpuDrm :: #import "gpu_drm";
 Tables :: #import "data_views/TableView";
 Theme :: #import "kryon/Theme";
 SystemTheme :: #import "kryon/SystemTheme";
@@ -85,6 +86,9 @@ app_columns: [5]string = .{"Task", "Status", "CPU", "Memory", "GPU"};
 app_fractions: [5]float32 = .{0.40, 0.20, 0.11, 0.17, 0.12};
 app_widths: [APP_COLUMNS]s32;
 widths_for: float32;
+widths_gpu: bool;
+// Set when a window was expanded or collapsed; Frame rebuilds the rows.
+apps_layout_changed: bool;
 
 group_order: [Model.MAX_PROCESSES]s32;
 raw_order: [Model.MAX_PROCESSES]s32;
@@ -122,19 +126,40 @@ text_stores_a: CellText;
 text_stores_b: CellText;
 text_active: s32;
 
-// Window manager task lists, also in two generations. CPU, memory and GPU are
-// the window's whole process tree (see Model.AppUsages).
+// Window manager task lists, also in two generations. A window row totals its
+// process tree (see Model.AppUsages); an expanded window lists those
+// processes under it. process is -1 on a window row.
+APP_ROWS :: Apps.MAX_WINDOWS + Model.MAX_PROCESSES;
+TASK_WIDTH :: Apps.TITLE_CAPACITY + 8;
+
+AppRow :: struct {
+    window: s32
+    process: s32
+}
+
 AppText :: struct {
     list: Apps.AppList
-    cell: [Apps.MAX_WINDOWS * APP_COLUMNS]string
-    cpu: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
-    mem: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
-    gpu: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
+    rows: [APP_ROWS]AppRow
+    row_count: s32
+    cell: [APP_ROWS * APP_COLUMNS]string
+    task: [APP_ROWS * TASK_WIDTH]u8
+    cpu: [APP_ROWS * CELL_WIDTH]u8
+    mem: [APP_ROWS * CELL_WIDTH]u8
+    gpu: [APP_ROWS * CELL_WIDTH]u8
 }
 
 app_pids: [Apps.MAX_WINDOWS]s32;
 no_external_gpus: [1]Model.GpuExternal;
 app_usage: [Apps.MAX_WINDOWS]Model.AppUsage;
+tree_pids: [Model.MAX_PROCESSES]s32;
+// NVML and DRM per-process GPU shares, merged for the current refresh.
+gpu_pids: [2 * Gpu.MAX_GPU_PROCESSES]s32;
+gpu_percent: [2 * Gpu.MAX_GPU_PROCESSES]float64;
+gpu_count: s32;
+// The GPU column appears only once a per-process source has data.
+app_gpu_shown: bool;
+expanded_windows: [Apps.MAX_WINDOWS]u64;
+expanded_window_count: s32;
 
 app_stores_a: AppText;
 app_stores_b: AppText;
@@ -156,7 +181,8 @@ scroll_offset: s32 = 0;
 
 app_selected_row: s32 = -1;
 app_selected_window: u64;
-app_selected_column: s32 = -1;
+// The process under the selected window, or -1 when the window row is.
+app_selected_pid: s32 = -1;
 app_scroll_offset: s32 = 0;
 
 refresh_interval_ms: s64 = SPEED_NORMAL_MS;
@@ -451,58 +477,181 @@ AppStatus :: (pid: s32) -> string {
     return "Running"
 }
 
-RebuildApps :: (store: *AppText) {
-    Apps.AppsRefresh(*store.list)
-    app_selected_row = -1
-    count := store.list.count
-    if count > 0 {
-        for index: 0..count - 1 { app_pids[index] = store.list.windows[index].pid }
-        shares := Gpu.GpuSharesCurrent()
-        Model.AppUsages(Model.Current(), app_pids[0:count], shares.pids[0:shares.count],
-            shares.percent[0:shares.count], Gpu.GpuSharesReady(), app_usage[0:count])
-        for index: 0..count - 1 {
-            entry := *store.list.windows[index]
-            usage := *app_usage[index]
-            base := index * APP_COLUMNS
-            text_base := index * CELL_WIDTH
-            if entry.id == app_selected_window { app_selected_row = index }
-            store.cell[base] = TextView(entry.title[0:entry.title_count])
-            store.cell[base + 1] = AppStatus(entry.pid)
-            if usage.found {
-                store.cell[base + APP_COLUMN_CPU] = Model.FormatCpu(usage.cpu_percent,
-                    store.cpu[text_base:text_base + CELL_WIDTH])
-                store.cell[base + APP_COLUMN_MEMORY] = Model.FormatBytes(usage.memory_bytes,
-                    store.mem[text_base:text_base + CELL_WIDTH])
-            } else {
-                store.cell[base + APP_COLUMN_CPU] = "-"
-                store.cell[base + APP_COLUMN_MEMORY] = "-"
-            }
-            if !usage.gpu_known {
-                store.cell[base + APP_COLUMN_GPU] = "n/a"
-            } else if usage.found {
-                store.cell[base + APP_COLUMN_GPU] = Model.FormatCpu(usage.gpu_percent,
-                    store.gpu[text_base:text_base + CELL_WIDTH])
-            } else {
-                store.cell[base + APP_COLUMN_GPU] = "-"
+WindowExpanded :: (id: u64) -> bool {
+    if expanded_window_count > 0 {
+        for index: 0..expanded_window_count - 1 {
+            if expanded_windows[index] == id { return true }
+        }
+    }
+    return false
+}
+
+ToggleWindow :: (id: u64) {
+    if expanded_window_count > 0 {
+        for index: 0..expanded_window_count - 1 {
+            if expanded_windows[index] == id {
+                expanded_window_count -= 1
+                expanded_windows[index] = expanded_windows[expanded_window_count]
+                return
             }
         }
     }
-    if app_selected_row < 0 { app_selected_window = 0 }
+    if expanded_window_count >= Apps.MAX_WINDOWS { return }
+    expanded_windows[expanded_window_count] = id
+    expanded_window_count += 1
 }
 
-BuildApps :: () {
+AddShares :: (shares: *Gpu.GpuShares) {
+    if shares.count <= 0 { return }
+    for index: 0..shares.count - 1 {
+        if gpu_count >= cast(s32)gpu_pids.count { return }
+        gpu_pids[gpu_count] = shares.pids[index]
+        gpu_percent[gpu_count] = shares.percent[index]
+        gpu_count += 1
+    }
+}
+
+GpuShareFor :: (pid: s32) -> float64 {
+    total: float64 = 0.0
+    if gpu_count > 0 {
+        for index: 0..gpu_count - 1 {
+            if gpu_pids[index] == pid { total += gpu_percent[index] }
+        }
+    }
+    return total
+}
+
+// Merges every per-process GPU source: NVML through its helper and DRM
+// fdinfo of the processes the windows own. DRM is sampled only on a regular
+// refresh while the tab is visible, so its rate is measured over a full
+// interval. Needs owners from a preceding Model.AppUsages call.
+CollectGpuShares :: (snapshot: *Model.Snapshot, sample: bool) {
+    if sample && current_tab == TAB_APPLICATIONS && snapshot.count > 0 {
+        owned: s32 = 0
+        for index: 0..snapshot.count - 1 {
+            if Model.ProcessOwner(snapshot, index) >= 0 {
+                tree_pids[owned] = snapshot.processes[index].pid
+                owned += 1
+            }
+        }
+        GpuDrm.DrmSample(tree_pids[0:owned])
+    }
+    gpu_count = 0
+    if Gpu.GpuSharesReady() { AddShares(Gpu.GpuSharesCurrent()) }
+    if GpuDrm.DrmAvailable() { AddShares(GpuDrm.DrmShares()) }
+    app_gpu_shown = Gpu.GpuSharesReady() || GpuDrm.DrmAvailable()
+}
+
+// Fills the CPU, Memory and GPU cells of ROW.
+UsageCells :: (store: *AppText, row: s32, cpu: float64, memory: u64, gpu: float64) {
+    base := row * APP_COLUMNS
+    text := row * CELL_WIDTH
+    store.cell[base + APP_COLUMN_CPU] = Model.FormatCpu(cpu, store.cpu[text:text + CELL_WIDTH])
+    store.cell[base + APP_COLUMN_MEMORY] = Model.FormatBytes(memory, store.mem[text:text + CELL_WIDTH])
+    store.cell[base + APP_COLUMN_GPU] = Model.FormatCpu(gpu, store.gpu[text:text + CELL_WIDTH])
+}
+
+AddWindowRow :: (store: *AppText, window: s32) {
+    row := store.row_count
+    if row >= APP_ROWS { return }
+    entry := *store.list.windows[window]
+    usage := *app_usage[window]
+    store.rows[row] = AppRow.{window = window, process = -1}
+    marker := "   "
+    if usage.processes > 0 { marker = ifx WindowExpanded(entry.id) then "▾ " else "▸ " }
+    parts: [2]string = .{marker, TextView(entry.title[0:entry.title_count])}
+    base := row * APP_COLUMNS
+    store.cell[base] = JoinAll(parts[:], store.task[row * TASK_WIDTH:(row + 1) * TASK_WIDTH])
+    store.cell[base + 1] = AppStatus(entry.pid)
+    if usage.found {
+        UsageCells(store, row, usage.cpu_percent, usage.memory_bytes, usage.gpu_percent)
+    } else {
+        store.cell[base + APP_COLUMN_CPU] = "-"
+        store.cell[base + APP_COLUMN_MEMORY] = "-"
+        store.cell[base + APP_COLUMN_GPU] = "-"
+    }
+    if entry.id == app_selected_window && app_selected_pid < 0 { app_selected_row = row }
+    store.row_count += 1
+}
+
+AddProcessRow :: (store: *AppText, window: s32, process_index: s32) {
+    row := store.row_count
+    if row >= APP_ROWS { return }
+    process := *Model.Current().processes[process_index]
+    store.rows[row] = AppRow.{window = window, process = process_index}
+    digits: [16]u8
+    name: [Model.NAME_CAPACITY]u8
+    if process.name_count > 0 {
+        for index: 0..process.name_count - 1 { name[index] = process.name[index] }
+    }
+    parts: [5]string = .{"      ", TextView(name[0:process.name_count]), "  (",
+        Number.FormatInteger(cast(s64)process.pid, digits[:]), ")"}
+    base := row * APP_COLUMNS
+    store.cell[base] = JoinAll(parts[:], store.task[row * TASK_WIDTH:(row + 1) * TASK_WIDTH])
+    store.cell[base + 1] = Model.StateName(process.state)
+    UsageCells(store, row, process.cpu_percent, process.memory_bytes, GpuShareFor(process.pid))
+    if store.list.windows[window].id == app_selected_window && process.pid == app_selected_pid {
+        app_selected_row = row
+    }
+    store.row_count += 1
+}
+
+// The processes counted toward WINDOW, in PID order. Windows of one process
+// share its owner slot, so each lists the same tree.
+AddProcessRows :: (store: *AppText, window: s32) {
+    snapshot := Model.Current()
+    index := Model.FindProcess(snapshot, app_pids[window])
+    if index < 0 { return }
+    owner := Model.ProcessOwner(snapshot, index)
+    for process: 0..snapshot.count - 1 {
+        if Model.ProcessOwner(snapshot, process) == owner { AddProcessRow(store, window, process) }
+    }
+}
+
+// Rebuilds the window list and its rows. SAMPLE is false when only the
+// expansion changed, so GPU rates are not measured over a split second.
+RebuildApps :: (store: *AppText, sample: bool) {
+    Apps.AppsRefresh(*store.list)
+    snapshot := Model.Current()
+    count := store.list.count
+    store.row_count = 0
+    app_selected_row = -1
+    if count > 0 {
+        for index: 0..count - 1 { app_pids[index] = store.list.windows[index].pid }
+        Model.AppUsages(snapshot, app_pids[0:count], gpu_pids[0:0], gpu_percent[0:0], false,
+            app_usage[0:count])
+        CollectGpuShares(snapshot, sample)
+        Model.AppUsages(snapshot, app_pids[0:count], gpu_pids[0:gpu_count],
+            gpu_percent[0:gpu_count], app_gpu_shown, app_usage[0:count])
+        for window: 0..count - 1 {
+            AddWindowRow(store, window)
+            if WindowExpanded(store.list.windows[window].id) { AddProcessRows(store, window) }
+        }
+    }
+    if app_selected_row < 0 {
+        app_selected_window = 0
+        app_selected_pid = -1
+    }
+}
+
+BuildApps :: (sample: bool = true) {
     if app_active == 0 {
-        RebuildApps(*app_stores_b)
+        RebuildApps(*app_stores_b, sample)
         app_active = 1
     } else {
-        RebuildApps(*app_stores_a)
+        RebuildApps(*app_stores_a, sample)
         app_active = 0
     }
 }
 
-ActiveApps :: () -> *Apps.AppList {
-    if app_active == 0 { return *app_stores_a.list }
-    return *app_stores_b.list
+ActiveAppText :: () -> *AppText {
+    if app_active == 0 { return *app_stores_a }
+    return *app_stores_b
+}
+
+// Task, Status, CPU and Memory, plus GPU when a source has data.
+AppColumnCount :: () -> s32 {
+    return ifx app_gpu_shown then APP_COLUMNS else APP_COLUMNS - 1
 }
 
 // Copies the message parts into the raw status bytes for later frames.
@@ -524,8 +673,9 @@ SetStatusText :: (text: string) {
 }
 
 ColumnWidths :: (width: float32) {
-    if widths_for == width { return }
+    if widths_for == width && widths_gpu == app_gpu_shown { return }
     widths_for = width
+    widths_gpu = app_gpu_shown
     usable := width - 18.0
     for column: 0..COLUMNS - 1 {
         value := cast(s32)(usable * process_fractions[column])
@@ -533,7 +683,10 @@ ColumnWidths :: (width: float32) {
         process_widths[column] = value
     }
     for column: 0..APP_COLUMNS - 1 {
-        value := cast(s32)(usable * app_fractions[column])
+        fraction := app_fractions[column]
+        // Without a GPU column its share goes to the Task names.
+        if column == 0 && !app_gpu_shown { fraction += app_fractions[APP_COLUMN_GPU] }
+        value := cast(s32)(usable * fraction)
         if value < 40 { value = 40 }
         app_widths[column] = value
     }
@@ -824,36 +977,43 @@ EndProcessDialog :: (session: Session) {
 }
 
 ApplicationsTab :: (session: Session, area: Rectangle) {
-    list := ActiveApps()
+    store := ActiveAppText()
+    list := *store.list
     table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
     if table_bounds.height < 60.0 { table_bounds.height = 60.0 }
-    rows: [Apps.MAX_WINDOWS]Tables.TableRow
-    count := list.count
-    if app_active == 0 {
-        if count > 0 {
-            for index: 0..count - 1 {
-                rows[index].cells = app_stores_a.cell[index * APP_COLUMNS:(index + 1) * APP_COLUMNS]
-            }
-        }
-    } else {
-        if count > 0 {
-            for index: 0..count - 1 {
-                rows[index].cells = app_stores_b.cell[index * APP_COLUMNS:(index + 1) * APP_COLUMNS]
+    rows: [APP_ROWS]Tables.TableRow
+    count := store.row_count
+    shown := AppColumnCount()
+    if count > 0 {
+        for index: 0..count - 1 {
+            base := index * APP_COLUMNS
+            if app_active == 0 {
+                rows[index].cells = app_stores_a.cell[base:base + shown]
+            } else {
+                rows[index].cells = app_stores_b.cell[base:base + shown]
             }
         }
     }
     table := Tables.TableView(session, Tables.TableViewProps.{.key = 200,
-        .bounds = table_bounds, .columns = app_columns[:], .rows = rows[0:count],
-        .column_widths = app_widths[:], .selected_row = app_selected_row,
-        .selected_column = app_selected_column, .sort_column = -1,
+        .bounds = table_bounds, .columns = app_columns[0:shown], .rows = rows[0:count],
+        .column_widths = app_widths[0:shown], .selected_row = app_selected_row,
+        .selected_column = -1, .sort_column = -1,
         .scroll_offset = app_scroll_offset, .row_height = 26, .header_height = 30,
         .resizable = true})
     app_selected_row = table.selected_row
-    app_selected_column = table.selected_column
     app_scroll_offset = table.scroll_offset
     app_selected_window = 0
+    app_selected_pid = -1
     if app_selected_row >= 0 && app_selected_row < count {
-        app_selected_window = list.windows[app_selected_row].id
+        row := store.rows[app_selected_row]
+        app_selected_window = list.windows[row.window].id
+        if row.process >= 0 {
+            app_selected_pid = Model.Current().processes[row.process].pid
+        } else if table.clicked_row == app_selected_row && app_usage[row.window].processes > 0 {
+            // Clicking a window shows or hides the processes it owns.
+            ToggleWindow(app_selected_window)
+            apps_layout_changed = true
+        }
     }
     if !list.available {
         CenteredLabel(session, 205, "No window manager task list is available on this display.",
@@ -1278,6 +1438,10 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         BuildOrder()
         pending_sort = false
     }
+    if apps_layout_changed && !refreshed {
+        BuildApps(false)
+    }
+    apps_layout_changed = false
 
     page := PageFor(viewport, 640.0)
     font := FontSize(*page, 14)

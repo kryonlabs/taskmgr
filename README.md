@@ -15,11 +15,15 @@ three-pane status bar.
 - **Applications** lists top-level EWMH windows and can switch to one, request
   that it close, or open a new command. CPU, Memory and GPU columns total each
   window's process tree: its `_NET_WM_PID` plus every descendant that no
-  nearer listed window owns. Windows without a PID show `-`. GPU shares come
-  from NVML on NVIDIA's driver, sampled by `taskmgr --gpu-helper`, a
-  display-free child of the same binary that runs only while this tab or
-  Performance is open,
-  so NVML's memory never enters the window process; other drivers show `n/a`.
+  nearer listed window owns. Clicking a window expands it to those processes.
+  Windows without a PID show `-`. Only top-level desktop windows appear, so
+  background services do not, and under Wayland only XWayland windows do.
+  Per-process GPU shares come from DRM fdinfo counters (AMD, Intel and other
+  drivers that publish them) and, on NVIDIA's driver, from NVML sampled by
+  `taskmgr --gpu-helper` (`taskmgr-gpu`), a display-free child of the same
+  binary that runs only while this tab or Performance is open, so NVML's
+  memory never enters the window process. The GPU column appears only once a
+  source has data. Shares below 10% show one decimal.
 - **Processes** is a sortable DataViews table with image name, PID, CPU, CPU
   time and resident memory. Rows are grouped by image name by default, with all
   Codex-family processes combined under `codex`; Options → Group Processes

@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Clicking an application expands it to the processes it owns, each with its
+  state, CPU, memory and GPU use.
+- AMD, Intel and other GPUs with standard DRM fdinfo counters now report
+  per-application GPU use, not only NVIDIA.
+
+### Changed
+
+- CPU and GPU shares show one decimal below 10% (`0.4`) instead of rounding
+  light use to `00`.
+- The Applications GPU column appears only when a per-process GPU source has
+  data, instead of a column of `n/a`.
+- The GPU helper process is named `taskmgr-gpu` instead of `exe`.
+
 ## [0.1.3] - 2026-11-13
 
 ### Added

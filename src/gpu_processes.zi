@@ -51,6 +51,8 @@ WriteRaw :: (fd: s32, bytes: *u8, count: usize) -> isize #foreign c "write";
 SleepRaw :: (micros: u32) -> s32 #foreign c "usleep";
 ParentRaw :: () -> s32 #foreign c "getppid";
 TimeRaw :: (output: *s64) -> s64 #foreign c "time";
+SetNameRaw :: (option: s32, name: *u8) -> s32 #foreign c "prctl";
+PR_SET_NAME :: 15;
 
 NVML_SUCCESS :: 0;
 MAX_DEVICES :: GPU_DEVICE_LIMIT;
@@ -399,6 +401,9 @@ HelperRequested :: (argc: s32, argv: **u8) -> bool {
 // stream one block per sample until the parent exits or stops reading.
 #program_export
 HelperMain :: () -> s32 {
+    // Started through /proc/self/exe, the helper would otherwise be "exe".
+    helper_name: [16]u8
+    if CopyCString("taskmgr-gpu", helper_name[:]) { unused SetNameRaw(PR_SET_NAME, *helper_name[0]) }
     parent := ParentRaw()
     if size_of(NvmlSample) != 32 || size_of(NvmlPci) != 68 || size_of(NvmlMemory) != 24 ||
        !LoadNvml() {

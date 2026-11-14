@@ -1,5 +1,6 @@
 using Model :: #import "model";
 Gpu :: #import "gpu_processes";
+GpuDrm :: #import "gpu_drm";
 Shortcuts :: #import "app_shortcuts";
 Files :: #import "std/file";
 
@@ -386,8 +387,10 @@ FormatTest :: () -> bool {
         print("format: adaptive meminfo units wrong\n")
         return false
     }
-    if Model.FormatCpu(7.4, buffer[:]) != "07" || Model.FormatCpu(42.6, buffer[:]) != "43" ||
-       Model.FormatCpu(0.0, buffer[:]) != "00" || Model.FormatCpu(100.0, buffer[:]) != "100" {
+    if Model.FormatCpu(7.4, buffer[:]) != "7.4" || Model.FormatCpu(42.6, buffer[:]) != "43" ||
+       Model.FormatCpu(0.0, buffer[:]) != "0.0" || Model.FormatCpu(0.04, buffer[:]) != "0.0" ||
+       Model.FormatCpu(0.36, buffer[:]) != "0.4" || Model.FormatCpu(9.96, buffer[:]) != "10" ||
+       Model.FormatCpu(100.0, buffer[:]) != "100" {
         print("format: cpu column wrong\n")
         return false
     }
@@ -672,6 +675,40 @@ ExternalGpuTest :: () -> bool {
     return true
 }
 
+// AMD/Intel per-process GPU use comes from DRM fdinfo counters.
+DrmFdinfoTest :: () -> bool {
+    amd := "pos:\t0\nflags:\t02100002\ndrm-driver:\tamdgpu\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t42\ndrm-memory-vram:\t1024 KiB\ndrm-engine-gfx:\t1500000 ns\ndrm-engine-compute:\t0 ns\n"
+    bytes: [256]u8
+    reading: GpuDrm.FdinfoClient
+    if !GpuDrm.ParseFdinfo(BytesOf(amd, bytes[:]), *reading) || reading.client != 42 ||
+       reading.count != 2 || reading.busy[0] != 1500000 || reading.capacity[0] != 1 {
+        print("drm: amdgpu fdinfo parsed wrong\n")
+        return false
+    }
+    intel := "drm-driver:\ti915\ndrm-client-id:\t7\ndrm-engine-capacity-video:\t2\ndrm-engine-video:\t900 ns\n"
+    video: GpuDrm.FdinfoClient
+    if !GpuDrm.ParseFdinfo(BytesOf(intel, bytes[:]), *video) || video.count != 1 ||
+       video.capacity[0] != 2 || video.busy[0] != 900 {
+        print("drm: engine capacity parsed wrong\n")
+        return false
+    }
+    none := "pos:\t0\nflags:\t02\n"
+    empty: GpuDrm.FdinfoClient
+    if GpuDrm.ParseFdinfo(BytesOf(none, bytes[:]), *empty) {
+        print("drm: non-DRM fdinfo accepted\n")
+        return false
+    }
+    // 250 ms busy in 1000 ms, then shared by two engine instances.
+    if GpuDrm.EnginePercent(0, 250000000, 0, 0, 1000, 1) != 25.0 ||
+       GpuDrm.EnginePercent(0, 250000000, 0, 0, 1000, 2) != 12.5 ||
+       GpuDrm.EnginePercent(100, 50, 0, 0, 1000, 1) != 0.0 ||
+       GpuDrm.EnginePercent(0, 30, 100, 200, 1000, 1) != 30.0 {
+        print("drm: engine percent wrong\n")
+        return false
+    }
+    return true
+}
+
 GpuSharesTest :: () -> bool {
     Gpu.GpuSharesReset()
     if Gpu.GpuSharesReady() {
@@ -731,6 +768,7 @@ main :: (argc: s32, argv: **u8) -> s32 {
     if !AppUsageTest() { print("application usage test failed\n"); return 76 }
     if !GpuSharesTest() { print("GPU shares test failed\n"); return 77 }
     if !ExternalGpuTest() { print("external GPU test failed\n"); return 78 }
+    if !DrmFdinfoTest() { print("DRM fdinfo test failed\n"); return 79 }
     if !SortTest() { print("sort test failed\n"); return 67 }
     if !FormatTest() { print("format test failed\n"); return 68 }
     if !SignalTest() { print("signal binding test failed\n"); return 69 }
