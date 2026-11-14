@@ -49,6 +49,6 @@ backend = "pixmap"
 [tool.kryon.install]
 profile = "desktop"
 name = "Task Manager"
-icon_name = "utilities-system-monitor"
+icon = "assets/taskmgr.svg"
 comment = "Kryon process monitor"
 categories = "Utility;System;"

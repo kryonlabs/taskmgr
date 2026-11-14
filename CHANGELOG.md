@@ -2,8 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-13
+
 ### Added
 
+- Debian package (`taskmgr-linux-amd64.deb`) and AppImage
+  (`taskmgr-linux-x86_64.AppImage`) downloads replace the Linux tarball, which
+  could not start on other machines because it lacked a Kryon library. Task
+  Manager also has its own icon.
 - The Applications tab shows CPU, memory and GPU use for each window, counting
   the window's whole process tree (a browser's helper processes count toward
   the browser). GPU use comes from NVIDIA's driver through a small helper that

@@ -62,7 +62,16 @@ make x11-test   # native app and Applications actions on a private Xvfb display
 make memory-test # steady native RSS on private Xvfb; must stay below 30 MiB
 make shot       # render one frame to build/taskmgr.ppm
 make check      # compile every module
+make package    # dist/taskmgr-linux-amd64.deb and dist/taskmgr-linux-x86_64.AppImage
 ```
+
+`make package` stages the app with `ziran install`, moves libraries the build
+produced (such as `libkryonavif.so`) to `/usr/lib/taskmgr` and points the
+program's RUNPATH there. It needs `patchelf`, `dpkg-deb`, `dpkg-shlibdeps` and,
+for the AppImage, `LINUXDEPLOY` set to a linuxdeploy AppImage. The release
+workflow publishes both files under these version-free names, so
+`https://github.com/kryonlabs/taskmgr/releases/latest/download/taskmgr-linux-amd64.deb`
+and `.../taskmgr-linux-x86_64.AppImage` always fetch the newest release.
 
 `make x11-test` never touches the current desktop. It needs `Xvfb`, `xfwm4`
 (or `X11_TEST_WM`), `xterm` and `xprop`; when one is absent it reports a skip.

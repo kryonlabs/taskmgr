@@ -43,7 +43,19 @@ jobs:
             build-essential cmake nasm meson ninja-build pkg-config \
             libsdl2-dev libgl1-mesa-dev libx11-dev \
             libcairo2-dev libpango1.0-dev libfontconfig1-dev libfreetype6-dev \
-            xvfb xfwm4 xterm x11-utils
+            xvfb xfwm4 xterm x11-utils \
+            patchelf dpkg-dev file
+
+      - name: Fetch linuxdeploy
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/linuxdeploy"
+          tool="$RUNNER_TEMP/linuxdeploy/linuxdeploy-x86_64.AppImage"
+          curl -fsSL -o "$tool" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  $tool" | sha256sum -c -
+          chmod 755 "$tool"
+          echo "LINUXDEPLOY=$tool" >> "$GITHUB_ENV"
 
       - name: Build locked Ziran
         working-directory: ziran
@@ -56,18 +68,16 @@ jobs:
             -u DBUS_SESSION_BUS_ADDRESS -u SESSION_MANAGER \
             HARMONY_DESKTOP_RECOVERY=0 make check test x11-test
 
-      - name: Package Linux binary
+      # Version-free names keep /releases/latest/download/<name> links stable.
+      - name: Package Debian and AppImage
         id: package
         run: |
           set -eu
           version=$(cat VERSION)
           tag="v$version"
-          package="taskmgr-linux-x86_64-$tag"
-          mkdir -p "dist/$package/bin"
-          cp build/taskmgr-desktop "dist/$package/bin/taskmgr"
-          cp README.md CHANGELOG.md "dist/$package/"
-          tar -C dist -czf "dist/$package.tar.gz" "$package"
-          sha256sum "dist/$package.tar.gz" > dist/SHA256SUMS
+          make package
+          (cd dist && sha256sum taskmgr-linux-amd64.deb taskmgr-linux-x86_64.AppImage > SHA256SUMS)
+          dpkg-deb -I dist/taskmgr-linux-amd64.deb
           if git rev-parse "$tag" >/dev/null 2>&1; then
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
@@ -75,7 +85,6 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "asset=dist/$package.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Publish new version
         if: steps.package.outputs.release == 'true'
@@ -83,7 +92,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.package.outputs.version }}
           TAG: ${{ steps.package.outputs.tag }}
-          ASSET: ${{ steps.package.outputs.asset }}
         run: |
           set -eu
           notes=$(awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {found=1; next} found && /^## / {exit} found' CHANGELOG.md)
@@ -92,5 +100,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Task Manager $VERSION"
           git push origin "$TAG"
-          gh release create "$TAG" "$ASSET" dist/SHA256SUMS \
+          gh release create "$TAG" dist/taskmgr-linux-amd64.deb \
+            dist/taskmgr-linux-x86_64.AppImage dist/SHA256SUMS \
             --title "Task Manager $VERSION" --notes "$notes"

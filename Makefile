@@ -4,7 +4,7 @@ ZIRAN ?= ./scripts/ziran.sh
 export LDLIBS += -lX11
 SOURCES := $(wildcard src/*.zi) $(wildcard tests/*.zi) ziran.toml ziran.lock scripts/ziran.sh Makefile
 
-.PHONY: all build run check test x11-test memory-test shot clean
+.PHONY: all build run check test x11-test memory-test shot package clean
 
 all: build
 
@@ -35,6 +35,12 @@ x11-test: build build/windows-test
 # Native RSS regression on a scrubbed private Xvfb display.
 memory-test: build
 	./scripts/memory-test.sh
+
+# dist/taskmgr-linux-amd64.deb and dist/taskmgr-linux-x86_64.AppImage. The
+# AppImage needs LINUXDEPLOY; see scripts/package-linux.sh.
+PACKAGE_FORMAT ?= all
+package: build
+	./scripts/package-linux.sh $(PACKAGE_FORMAT) "$$(cat VERSION)" dist
 
 # One rendered frame without a display; useful for interface checks.
 shot: build
