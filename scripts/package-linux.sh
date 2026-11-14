@@ -64,8 +64,12 @@ trap 'rm -rf "$stage"' EXIT INT TERM
 prefix=$stage/root/usr
 
 # Kryon's install also writes an autostart entry when asked; keep it inside
-# the stage instead of the packager's own configuration.
-XDG_CONFIG_HOME=$stage/config "$ZIRAN" install --prefix "$prefix" --locked >/dev/null
+# the stage instead of the packager's own configuration. Ziran refuses
+# --locked next to a ziran.local.toml override (as release CI uses).
+lock_flag=--locked
+[ ! -f ziran.local.toml ] || lock_flag=
+# shellcheck disable=SC2086
+XDG_CONFIG_HOME=$stage/config "$ZIRAN" install --prefix "$prefix" $lock_flag >/dev/null
 
 program=$prefix/bin/$bin
 [ -x "$program" ] || { echo "package-linux: $program was not installed" >&2; exit 66; }
