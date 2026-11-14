@@ -4,6 +4,7 @@
 #import "kryon/desktop_loop";
 using Kryon :: #import "kryon/Kryon";
 App :: #import "app";
+Gpu :: #import "gpu_processes";
 
 // Custom hosts currently provide the bridge symbol consumed by desktop_loop.
 #program_export
@@ -11,7 +12,11 @@ ProjectFrame :: (session: Session, viewport: Rectangle) -> s32 {
     return App.Frame(session, viewport)
 }
 
+// `taskmgr --gpu-helper` is the display-free NVML sampler the Applications
+// tab starts from this same binary (see gpu_processes.zi).
 #program_export
-main :: () -> s32 {
+main :: (argc: s32, argv: **u8) -> s32 {
+    if Gpu.HelperRequested(argc, argv) { return Gpu.HelperMain() }
+    Gpu.GpuSharesEnable()
     return RunDesktop(400, 480)
 }

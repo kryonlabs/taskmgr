@@ -1,0 +1,541 @@
+// Per-process GPU shares for the Applications tab. NVIDIA's proprietary
+// driver publishes no per-process DRM fdinfo counters, so NVML is the source.
+// A query is cheap (about 2.5 ms of CPU), but loading NVML keeps roughly 16 MB
+// of private memory even after nvmlShutdown, and `nvidia-smi pmon` costs about
+// 3% of a core. So taskmgr starts its own binary again as `--gpu-helper`: that
+// child loads NVML, samples once a second and streams plain text, while the
+// window process only parses lines and keeps its compact memory budget.
+//
+// The helper runs only while the Applications tab is visible, never touches a
+// display, and exits when its parent goes away. Without an NVIDIA driver no
+// helper starts and the GPU column reads n/a.
+//
+// The same samples also carry each card's whole-device usage and VRAM, which
+// the Performance tab needs because NVIDIA's driver has no sysfs counters.
+//
+// Protocol, one block per sample: "T"; per device "D <domain> <bus> <slot>
+// <busy%> <vram used> <vram total>" with "-" for an unsupported counter; then
+// "<pid> <percent>" for each GPU process (one line per device it used); then
+// "E". "X" means NVML is unusable.
+
+Model :: #import "model";
+Channel :: #import "std/process_channel_linux";
+Files :: #import "std/file";
+Number :: #import "std/number_text";
+
+MAX_GPU_PROCESSES :: 256;
+HELPER_ARGUMENT :: "--gpu-helper";
+
+GpuShares :: struct {
+    pids: [MAX_GPU_PROCESSES]s32
+    percent: [MAX_GPU_PROCESSES]float64
+    count: s32
+}
+
+GPU_DEVICE_LIMIT :: 16;
+
+GpuDeviceReadings :: struct {
+    items: [GPU_DEVICE_LIMIT]Model.GpuExternal
+    count: s32
+}
+
+#scope_file
+
+c :: #system_library "c";
+dl :: #system_library "dl";
+
+DlOpen :: (path: *u8, flags: s32) -> *void #foreign dl "dlopen";
+DlSymbol :: (handle: *void, name: *u8) -> *void #foreign dl "dlsym";
+MemoryCopy :: (target: *void, source: *void, bytes: usize) -> *void #foreign c "memcpy";
+WriteRaw :: (fd: s32, bytes: *u8, count: usize) -> isize #foreign c "write";
+SleepRaw :: (micros: u32) -> s32 #foreign c "usleep";
+ParentRaw :: () -> s32 #foreign c "getppid";
+TimeRaw :: (output: *s64) -> s64 #foreign c "time";
+
+NVML_SUCCESS :: 0;
+MAX_DEVICES :: GPU_DEVICE_LIMIT;
+MAX_SAMPLES :: 1024;
+SAMPLE_MICROS :: 1000000;
+
+// nvmlProcessUtilizationSample_t: 32 bytes with the padding after pid.
+NvmlSample :: struct {
+    pid: u32
+    timestamp: u64
+    sm: u32
+    memory: u32
+    encoder: u32
+    decoder: u32
+}
+
+// nvmlPciInfo_t (v3), nvmlUtilization_t and nvmlMemory_t.
+NvmlPci :: struct {
+    bus_id_legacy: [16]u8
+    domain: u32
+    bus: u32
+    device: u32
+    pci_device_id: u32
+    pci_subsystem_id: u32
+    bus_id: [32]u8
+}
+
+NvmlUtilization :: struct {
+    gpu: u32
+    memory: u32
+}
+
+NvmlMemory :: struct {
+    total: u64
+    free: u64
+    used: u64
+}
+
+FnInit :: #type () -> s32 #c_call;
+FnCount :: #type (*u32) -> s32 #c_call;
+FnHandle :: #type (u32, **void) -> s32 #c_call;
+FnUtilization :: #type (*void, *NvmlSample, *u32, u64) -> s32 #c_call;
+FnPci :: #type (*void, *NvmlPci) -> s32 #c_call;
+FnRates :: #type (*void, *NvmlUtilization) -> s32 #c_call;
+FnMemory :: #type (*void, *NvmlMemory) -> s32 #c_call;
+
+nvml_init: FnInit;
+nvml_count: FnCount;
+nvml_handle: FnHandle;
+nvml_utilization: FnUtilization;
+nvml_pci: FnPci;
+nvml_rates: FnRates;
+nvml_memory: FnMemory;
+
+samples: [MAX_SAMPLES]NvmlSample;
+
+// Helper-side accumulation for one device in one tick: samples per PID are
+// averaged, since NVML reports several short sampling periods per second.
+device_pids: [MAX_GPU_PROCESSES]s32;
+device_sums: [MAX_GPU_PROCESSES]u64;
+device_samples: [MAX_GPU_PROCESSES]s32;
+device_count_used: s32;
+tick_text: [MAX_GPU_PROCESSES * MAX_DEVICES * 24 + 16]u8;
+tick_length: s32;
+
+// Window-side state.
+enabled: bool;
+running: bool;
+unavailable: bool;
+has_data: bool;
+channel: Channel.ProcessChannel;
+line: [64]u8;
+line_count: s32;
+line_overflow: bool;
+staging: GpuShares;
+current: GpuShares;
+staging_devices: GpuDeviceReadings;
+current_devices: GpuDeviceReadings;
+
+CopyCString :: (text: string, output: []u8) -> bool {
+    if cast(s32)text.count >= cast(s32)output.count { return false }
+    index: s32 = 0
+    for byte: text {
+        if byte == 0 { return false }
+        output[index] = byte
+        index += 1
+    }
+    output[index] = 0
+    return true
+}
+
+Resolve :: (handle: *void, slot: *void, name: string) -> bool {
+    bytes: [64]u8
+    if !CopyCString(name, bytes[:]) { return false }
+    symbol: *void = DlSymbol(handle, *bytes[0])
+    if symbol == null { return false }
+    MemoryCopy(slot, cast(*void)*symbol, size_of(*void))
+    return true
+}
+
+LoadNvml :: () -> bool {
+    name: [32]u8
+    if !CopyCString("libnvidia-ml.so.1", name[:]) { return false }
+    // RTLD_LAZY | RTLD_LOCAL
+    handle: *void = DlOpen(*name[0], 1)
+    if handle == null { return false }
+    ok := Resolve(handle, cast(*void)*nvml_init, "nvmlInit_v2")
+    ok = ok && Resolve(handle, cast(*void)*nvml_count, "nvmlDeviceGetCount_v2")
+    ok = ok && Resolve(handle, cast(*void)*nvml_handle, "nvmlDeviceGetHandleByIndex_v2")
+    ok = ok && Resolve(handle, cast(*void)*nvml_utilization, "nvmlDeviceGetProcessUtilization")
+    ok = ok && Resolve(handle, cast(*void)*nvml_pci, "nvmlDeviceGetPciInfo_v3")
+    ok = ok && Resolve(handle, cast(*void)*nvml_rates, "nvmlDeviceGetUtilizationRates")
+    ok = ok && Resolve(handle, cast(*void)*nvml_memory, "nvmlDeviceGetMemoryInfo")
+    return ok && nvml_init() == NVML_SUCCESS
+}
+
+TickAppend :: (piece: string) {
+    for byte: piece {
+        if tick_length >= cast(s32)tick_text.count { return }
+        tick_text[tick_length] = byte
+        tick_length += 1
+    }
+}
+
+// Writes the pending tick text to standard output; false once the parent
+// has stopped reading.
+EmitTick :: () -> bool {
+    written: s32 = 0
+    while written < tick_length {
+        count := WriteRaw(1, *tick_text[written], cast(usize)(tick_length - written))
+        if count <= cast(isize)0 { return false }
+        written += cast(s32)count
+    }
+    return true
+}
+
+EmitUnavailable :: () {
+    tick_length = 0
+    TickAppend("X\n")
+    unused EmitTick()
+}
+
+Accumulate :: (pid: s32, sm: u32) {
+    if pid <= 0 { return }
+    if device_count_used > 0 {
+        for index: 0..device_count_used - 1 {
+            if device_pids[index] == pid {
+                device_sums[index] += cast(u64)sm
+                device_samples[index] += 1
+                return
+            }
+        }
+    }
+    if device_count_used >= MAX_GPU_PROCESSES { return }
+    device_pids[device_count_used] = pid
+    device_sums[device_count_used] = cast(u64)sm
+    device_samples[device_count_used] = 1
+    device_count_used += 1
+}
+
+TickNumber :: (value: s64) {
+    digits: [24]u8
+    if value < 0 {
+        TickAppend("-")
+        return
+    }
+    TickAppend(Number.FormatInteger(value, digits[:]))
+}
+
+// Appends one device's whole-card line: busy percent and VRAM bytes.
+AppendDeviceLine :: (device: *void, pci: *NvmlPci) {
+    busy: s64 = -1
+    rates: NvmlUtilization
+    if nvml_rates(device, *rates) == NVML_SUCCESS { busy = cast(s64)rates.gpu }
+    used: s64 = -1
+    total: s64 = -1
+    memory: NvmlMemory
+    if nvml_memory(device, *memory) == NVML_SUCCESS && memory.total > 0 {
+        used = cast(s64)memory.used
+        total = cast(s64)memory.total
+    }
+    TickAppend("D ")
+    TickNumber(cast(s64)pci.domain)
+    TickAppend(" ")
+    TickNumber(cast(s64)pci.bus)
+    TickAppend(" ")
+    TickNumber(cast(s64)pci.device)
+    TickAppend(" ")
+    TickNumber(busy)
+    TickAppend(" ")
+    TickNumber(used)
+    TickAppend(" ")
+    TickNumber(total)
+    TickAppend("\n")
+}
+
+// Appends one device's averaged shares to the tick block.
+FlushDevice :: () {
+    if device_count_used <= 0 { return }
+    digits: [24]u8
+    for index: 0..device_count_used - 1 {
+        average := (device_sums[index] + cast(u64)(device_samples[index] / 2)) /
+            cast(u64)device_samples[index]
+        TickAppend(Number.FormatInteger(cast(s64)device_pids[index], digits[:]))
+        TickAppend(" ")
+        TickAppend(Number.FormatInteger(cast(s64)average, digits[:]))
+        TickAppend("\n")
+    }
+    device_count_used = 0
+}
+
+ParseDigits :: (text: []u8, start: s32, limit: s64 = 2147483647) -> (value: s64, next: s32, ok: bool) {
+    cursor := start
+    value: s64 = 0
+    total := cast(s32)text.count
+    while cursor < total && text[cursor] >= 48 && text[cursor] <= 57 {
+        if value > (limit - cast(s64)(text[cursor] - 48)) / 10 { return 0, cursor, false }
+        value = value * 10 + cast(s64)(text[cursor] - 48)
+        cursor += 1
+    }
+    return value, cursor, cursor > start
+}
+
+// One space-separated device field: a number, or "-" for unsupported (-1).
+DeviceField :: (text: []u8, start: s32) -> (value: s64, next: s32, ok: bool) {
+    total := cast(s32)text.count
+    if start >= total { return 0, start, false }
+    value: s64 = -1
+    cursor := start + 1
+    if text[start] != 45 {
+        number, after, number_ok := ParseDigits(text, start, 9223372036854775807)
+        if !number_ok { return 0, after, false }
+        value = number
+        cursor = after
+    }
+    if cursor < total {
+        if text[cursor] != 32 { return 0, cursor, false }
+        cursor += 1
+    }
+    return value, cursor, true
+}
+
+ParseDeviceLine :: (text: []u8) {
+    values: [6]s64
+    cursor: s32 = 2
+    for index: 0..5 {
+        value, next, ok := DeviceField(text, cursor)
+        if !ok { return }
+        values[index] = value
+        cursor = next
+    }
+    if cursor != cast(s32)text.count || values[0] < 0 || values[1] < 0 || values[2] < 0 { return }
+    if staging_devices.count >= GPU_DEVICE_LIMIT { return }
+    reading := *staging_devices.items[staging_devices.count]
+    reading.domain = cast(u32)values[0]
+    reading.bus = cast(u32)values[1]
+    reading.slot = cast(u32)values[2]
+    reading.busy = values[3]
+    reading.vram_used = values[4]
+    reading.vram_total = values[5]
+    staging_devices.count += 1
+}
+
+ParseLine :: (text: []u8) {
+    if text.count == 1 && text[0] == 84 { // T
+        staging.count = 0
+        staging_devices.count = 0
+        return
+    }
+    if text.count == 1 && text[0] == 69 { // E
+        current = staging
+        current_devices = staging_devices
+        has_data = true
+        return
+    }
+    if text.count > 2 && text[0] == 68 && text[1] == 32 { // D
+        ParseDeviceLine(text)
+        return
+    }
+    if text.count == 1 && text[0] == 88 { // X
+        unavailable = true
+        has_data = false
+        return
+    }
+    pid, after_pid, pid_ok := ParseDigits(text, 0)
+    if !pid_ok || after_pid >= cast(s32)text.count || text[after_pid] != 32 { return }
+    percent, after_percent, percent_ok := ParseDigits(text, after_pid + 1)
+    if !percent_ok || after_percent != cast(s32)text.count || pid <= 0 { return }
+    if staging.count >= MAX_GPU_PROCESSES { return }
+    staging.pids[staging.count] = cast(s32)pid
+    staging.percent[staging.count] = cast(float64)percent
+    staging.count += 1
+}
+
+StartHelper :: () -> bool {
+    probe := Files.OpenRead("/proc/driver/nvidia/version")
+    if !probe.valid {
+        unavailable = true
+        return false
+    }
+    Files.CloseFile(probe)
+    arguments: [2]string = .["/proc/self/exe", HELPER_ARGUMENT]
+    channel = Channel.StartChannel(arguments[:], false, true)
+    if channel.pid <= 0 {
+        unavailable = true
+        return false
+    }
+    running = true
+    has_data = false
+    line_count = 0
+    line_overflow = false
+    staging.count = 0
+    current.count = 0
+    staging_devices.count = 0
+    current_devices.count = 0
+    return true
+}
+
+StopHelper :: () {
+    if running { unused Channel.CancelChannel(*channel) }
+    running = false
+    has_data = false
+    staging.count = 0
+    current.count = 0
+    staging_devices.count = 0
+    current_devices.count = 0
+}
+
+#scope_export
+
+// Whether ARGV asks this binary to run as the GPU sampling helper.
+#program_export
+HelperRequested :: (argc: s32, argv: **u8) -> bool {
+    if argc != 2 || argv == null { return false }
+    argument := argv[1]
+    if argument == null { return false }
+    index: s32 = 0
+    for byte: HELPER_ARGUMENT {
+        if argument[index] != byte { return false }
+        index += 1
+    }
+    return argument[index] == 0
+}
+
+// The helper's whole life: sample every NVIDIA device once a second and
+// stream one block per sample until the parent exits or stops reading.
+#program_export
+HelperMain :: () -> s32 {
+    parent := ParentRaw()
+    if size_of(NvmlSample) != 32 || size_of(NvmlPci) != 68 || size_of(NvmlMemory) != 24 ||
+       !LoadNvml() {
+        EmitUnavailable()
+        return 1
+    }
+    device_total: u32 = 0
+    if nvml_count(*device_total) != NVML_SUCCESS || device_total == 0 {
+        EmitUnavailable()
+        return 1
+    }
+    if device_total > MAX_DEVICES { device_total = MAX_DEVICES }
+    devices: [MAX_DEVICES]*void
+    last_seen: [MAX_DEVICES]u64
+    pci: [MAX_DEVICES]NvmlPci
+    pci_ok: [MAX_DEVICES]bool
+    // NVML timestamps are wall-clock microseconds. Starting one second back
+    // skips the driver's older buffer, which can exceed any fixed array.
+    now_seconds := TimeRaw(null)
+    for index: 0..cast(s32)device_total - 1 {
+        devices[index] = null
+        if nvml_handle(cast(u32)index, *devices[index]) != NVML_SUCCESS { devices[index] = null }
+        pci_ok[index] = devices[index] != null && nvml_pci(devices[index], *pci[index]) == NVML_SUCCESS
+        last_seen[index] = 0
+        if now_seconds > 1 { last_seen[index] = cast(u64)(now_seconds - 1) * cast(u64)SAMPLE_MICROS }
+    }
+    while true {
+        tick_length = 0
+        TickAppend("T\n")
+        for device: 0..cast(s32)device_total - 1 {
+            if devices[device] == null { continue }
+            if pci_ok[device] { AppendDeviceLine(devices[device], *pci[device]) }
+            count: u32 = MAX_SAMPLES
+            device_count_used = 0
+            // NVML_ERROR_NOT_FOUND means no new samples: the device was idle.
+            if nvml_utilization(devices[device], *samples[0], *count, last_seen[device]) == NVML_SUCCESS {
+                if count > MAX_SAMPLES { count = MAX_SAMPLES }
+                newest := last_seen[device]
+                if count > 0 {
+                    for index: 0..cast(s32)count - 1 {
+                        sample := *samples[index]
+                        if sample.timestamp <= last_seen[device] { continue }
+                        if sample.timestamp > newest { newest = sample.timestamp }
+                        Accumulate(cast(s32)(sample.pid & 0x7fffffff), sample.sm)
+                    }
+                }
+                last_seen[device] = newest
+                FlushDevice()
+            }
+        }
+        TickAppend("E\n")
+        if !EmitTick() { return 0 }
+        if ParentRaw() != parent { return 0 }
+        unused SleepRaw(SAMPLE_MICROS)
+        if ParentRaw() != parent { return 0 }
+    }
+    return 0
+}
+
+// Allows the window process to start a helper. Only the native desktop host
+// calls this, because only its main recognizes HELPER_ARGUMENT.
+#program_export
+GpuSharesEnable :: () {
+    enabled = true
+}
+
+// Starts, drains or stops the helper. ACTIVE is whether the Applications tab
+// is visible; leaving it stops the child so it costs nothing elsewhere.
+#program_export
+GpuSharesPoll :: (active: bool) {
+    if !enabled || unavailable { return }
+    if !active {
+        StopHelper()
+        return
+    }
+    if !running && !StartHelper() { return }
+    buffer: [4096]u8
+    reads: s32 = 0
+    while reads < 64 {
+        received := Channel.ChannelReceive(channel, buffer[:], 0)
+        if received < 0 { break }
+        if received == 0 {
+            StopHelper()
+            unavailable = true
+            return
+        }
+        GpuSharesFeed(buffer[0:received])
+        reads += 1
+    }
+    if unavailable { StopHelper() }
+}
+
+// Parses helper output; partial lines wait for the rest.
+#program_export
+GpuSharesFeed :: (bytes: []u8) {
+    for byte: bytes {
+        if byte == 10 {
+            if !line_overflow { ParseLine(line[0:line_count]) }
+            line_count = 0
+            line_overflow = false
+            continue
+        }
+        if line_count >= cast(s32)line.count {
+            line_overflow = true
+            continue
+        }
+        line[line_count] = byte
+        line_count += 1
+    }
+}
+
+// True once a complete sample has arrived and the source is still usable.
+#program_export
+GpuSharesReady :: () -> bool {
+    return has_data && !unavailable
+}
+
+#program_export
+GpuSharesCurrent :: () -> *GpuShares {
+    return *current
+}
+
+// Whole-card readings from the latest sample; check GpuSharesReady first.
+#program_export
+GpuDevicesCurrent :: () -> *GpuDeviceReadings {
+    return *current_devices
+}
+
+// Clears parser state; for tests.
+#program_export
+GpuSharesReset :: () {
+    has_data = false
+    unavailable = false
+    line_count = 0
+    line_overflow = false
+    staging.count = 0
+    current.count = 0
+    staging_devices.count = 0
+    current_devices.count = 0
+}

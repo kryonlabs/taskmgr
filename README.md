@@ -13,7 +13,13 @@ bar, Applications / Processes / Performance tabs, bordered content and the
 three-pane status bar.
 
 - **Applications** lists top-level EWMH windows and can switch to one, request
-  that it close, or open a new command.
+  that it close, or open a new command. CPU, Memory and GPU columns total each
+  window's process tree: its `_NET_WM_PID` plus every descendant that no
+  nearer listed window owns. Windows without a PID show `-`. GPU shares come
+  from NVML on NVIDIA's driver, sampled by `taskmgr --gpu-helper`, a
+  display-free child of the same binary that runs only while this tab or
+  Performance is open,
+  so NVML's memory never enters the window process; other drivers show `n/a`.
 - **Processes** is a sortable DataViews table with image name, PID, CPU, CPU
   time and resident memory. Rows are grouped by image name by default, with all
   Codex-family processes combined under `codex`; Options → Group Processes
@@ -25,8 +31,11 @@ three-pane status bar.
   Windows-style colored lines on black, plus process, thread, handle,
   physical-memory, commit and kernel-memory totals. Every detected DRM card
   has a stable `cardN` label, distinct graph color and independent GPU/VRAM
-  reading; unsupported counters display `n/a`. Memory values use explicit
-  adaptive B, KB, MB, GB or TB units.
+  reading; unsupported counters display `n/a`. NVIDIA's driver has no sysfs
+  GPU counters, so its cards use the same `--gpu-helper` NVML samples as the
+  Applications tab, matched to `cardN` by PCI address, while this tab or
+  Applications is open. Memory values use explicit adaptive B, KB, MB, GB or
+  TB units.
 - File, Options, View and Help menus provide Run, refresh speed, manual refresh,
   kernel-time display, process grouping, end-process confirmation and About
   actions.

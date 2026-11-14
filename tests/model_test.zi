@@ -1,4 +1,5 @@
 using Model :: #import "model";
+Gpu :: #import "gpu_processes";
 Shortcuts :: #import "app_shortcuts";
 Files :: #import "std/file";
 
@@ -41,7 +42,7 @@ ParserTest :: () -> bool {
     }
     if TextView(process.name[0:process.name_count]) != "worker (stage) name" ||
        process.state != Model.STATE_SLEEPING || process.ticks != 23 ||
-       process.memory_bytes == 0 || process.threads != 17 {
+       process.memory_bytes == 0 || process.threads != 17 || process.ppid != 1 {
         print("parse: process stat fields wrong\n")
         return false
     }
@@ -570,6 +571,153 @@ GroupSignalTest :: () -> bool {
     return true
 }
 
+AddProcess :: (snapshot: *Model.Snapshot, pid: s32, ppid: s32, cpu: float64, memory: u64) {
+    entry := *snapshot.processes[snapshot.count]
+    entry.pid = pid
+    entry.ppid = ppid
+    entry.cpu_percent = cpu
+    entry.memory_bytes = memory
+    entry.group_count = 1
+    snapshot.count += 1
+}
+
+// Window rows own their process tree; the nearest listed ancestor wins, so a
+// browser started from a terminal is not counted twice.
+AppUsageTest :: () -> bool {
+    snapshot: Model.Snapshot
+    // Deliberately out of PID order: /proc order is only usually ascending.
+    AddProcess(*snapshot, 500, 1, 1.0, 1000)    // terminal (window 0)
+    AddProcess(*snapshot, 501, 500, 2.0, 200)   // shell under the terminal
+    AddProcess(*snapshot, 900, 501, 10.0, 5000) // browser (window 1), from the shell
+    AddProcess(*snapshot, 901, 900, 20.0, 3000) // browser renderer
+    AddProcess(*snapshot, 902, 901, 5.0, 100)   // grandchild of the browser
+    AddProcess(*snapshot, 700, 1, 50.0, 9999)   // unrelated daemon
+    AddProcess(*snapshot, 1, 0, 0.0, 10)        // init
+    window_pids: [5]s32 = .[500, 900, 0, 4242, 900]
+    gpu_pids: [3]s32 = .[901, 902, 700]
+    gpu_percent: [3]float64 = .[30.0, 4.0, 60.0]
+    usage: [5]Model.AppUsage
+    Model.AppUsages(*snapshot, window_pids[:], gpu_pids[:], gpu_percent[:], true, usage[:])
+    terminal := usage[0]
+    if !terminal.found || terminal.processes != 2 || terminal.cpu_percent != 3.0 ||
+       terminal.memory_bytes != 1200 || terminal.gpu_percent != 0.0 || !terminal.gpu_known {
+        print("apps: terminal tree totals wrong\n")
+        return false
+    }
+    browser := usage[1]
+    if !browser.found || browser.processes != 3 || browser.cpu_percent != 35.0 ||
+       browser.memory_bytes != 8100 || browser.gpu_percent != 34.0 {
+        print("apps: browser tree totals wrong\n")
+        return false
+    }
+    if usage[2].found || usage[3].found {
+        print("apps: windows without a live PID reported usage\n")
+        return false
+    }
+    if !usage[4].found || usage[4].processes != 3 || usage[4].memory_bytes != 8100 {
+        print("apps: second window of one process did not share its totals\n")
+        return false
+    }
+    Model.AppUsages(*snapshot, window_pids[:], gpu_pids[0:0], gpu_percent[0:0], false, usage[:])
+    if usage[1].gpu_known || usage[1].gpu_percent != 0.0 || usage[1].cpu_percent != 35.0 {
+        print("apps: missing GPU source not reported as unknown\n")
+        return false
+    }
+    return true
+}
+
+// NVIDIA cards get their whole-card readings from the helper, matched to the
+// DRM card by the PCI address in its uevent file.
+ExternalGpuTest :: () -> bool {
+    uevent := "DRIVER=nvidia\nPCI_CLASS=30000\nPCI_SLOT_NAME=0000:0a:1f.0\nMODALIAS=pci:v000010DE\n"
+    bytes: [128]u8
+    domain, bus, slot, function, ok := Model.PciSlotFromUevent(BytesOf(uevent, bytes[:]))
+    if !ok || domain != 0 || bus != 10 || slot != 31 || function != 0 {
+        print("external gpu: PCI slot parsed wrong\n")
+        return false
+    }
+    unused_domain, unused_bus, unused_slot, unused_function, bad := Model.PciSlotFromUevent(
+        BytesOf("XPCI_SLOT_NAME=0000:01:00.0\n", bytes[:]))
+    if bad {
+        print("external gpu: label matched mid-line\n")
+        return false
+    }
+    readings: [2]Model.GpuExternal
+    readings[0] = Model.GpuExternal.{domain = 0, bus = 1, slot = 0, busy = 37,
+        vram_used = 512, vram_total = 2048}
+    readings[1] = Model.GpuExternal.{domain = 0, bus = 10, slot = 31, busy = -1,
+        vram_used = -1, vram_total = -1}
+    Model.SetExternalGpus(readings[:])
+    if Model.ExternalGpuFor(0, 1, 0) != 0 || Model.ExternalGpuFor(0, 10, 31) != 1 ||
+       Model.ExternalGpuFor(1, 1, 0) != -1 {
+        print("external gpu: PCI match wrong\n")
+        return false
+    }
+    snapshot: Model.Snapshot
+    Model.AddGpuValues(*snapshot, 1, readings[0].busy, readings[0].vram_used, readings[0].vram_total)
+    Model.AddGpuValues(*snapshot, 0, readings[1].busy, readings[1].vram_used, readings[1].vram_total)
+    Model.FinalizeGpuStats(*snapshot)
+    if snapshot.gpu_count != 2 || snapshot.gpus[0].card_index != 0 ||
+       snapshot.gpus[0].busy_supported || snapshot.gpus[0].vram_supported ||
+       !snapshot.gpus[1].busy_supported || snapshot.gpus[1].busy_percent != 37.0 ||
+       snapshot.vram_used != 512 || snapshot.vram_total != 2048 || snapshot.gpu_percent != 37.0 {
+        print("external gpu: readings not applied\n")
+        return false
+    }
+    Model.SetExternalGpus(readings[0:0])
+    if Model.ExternalGpuFor(0, 1, 0) != -1 {
+        print("external gpu: cleared readings still matched\n")
+        return false
+    }
+    return true
+}
+
+GpuSharesTest :: () -> bool {
+    Gpu.GpuSharesReset()
+    if Gpu.GpuSharesReady() {
+        print("gpu: ready before any sample\n")
+        return false
+    }
+    first := "T\n2677 1\n552"
+    rest := "68 12\nbogus line\n9 \nE\n"
+    bytes: [128]u8
+    Gpu.GpuSharesFeed(BytesOf("T\nD 0 1 0 3 574619648 17103781888\nD 0 2 0 - - -\nD 0 x\nE\n", bytes[:]))
+    devices := Gpu.GpuDevicesCurrent()
+    if !Gpu.GpuSharesReady() || devices.count != 2 || devices.items[0].bus != 1 ||
+       devices.items[0].busy != 3 || devices.items[0].vram_used != 574619648 ||
+       devices.items[0].vram_total != 17103781888 || devices.items[1].bus != 2 ||
+       devices.items[1].busy != -1 || devices.items[1].vram_total != -1 {
+        print("gpu: device lines parsed wrong\n")
+        return false
+    }
+    Gpu.GpuSharesReset()
+    Gpu.GpuSharesFeed(BytesOf(first, bytes[:]))
+    if Gpu.GpuSharesReady() {
+        print("gpu: incomplete block published\n")
+        return false
+    }
+    Gpu.GpuSharesFeed(BytesOf(rest, bytes[:]))
+    shares := Gpu.GpuSharesCurrent()
+    if !Gpu.GpuSharesReady() || shares.count != 2 || shares.pids[0] != 2677 ||
+       shares.percent[0] != 1.0 || shares.pids[1] != 55268 || shares.percent[1] != 12.0 {
+        print("gpu: sample block parsed wrong\n")
+        return false
+    }
+    // An idle tick replaces the previous block with no processes.
+    Gpu.GpuSharesFeed(BytesOf("T\nE\n", bytes[:]))
+    if !Gpu.GpuSharesReady() || Gpu.GpuSharesCurrent().count != 0 {
+        print("gpu: idle sample kept stale shares\n")
+        return false
+    }
+    Gpu.GpuSharesFeed(BytesOf("X\n", bytes[:]))
+    if Gpu.GpuSharesReady() {
+        print("gpu: unusable source still ready\n")
+        return false
+    }
+    Gpu.GpuSharesReset()
+    return true
+}
+
 main :: (argc: s32, argv: **u8) -> s32 {
     if argc != 1 {
         print("usage: model_test\n")
@@ -580,6 +728,9 @@ main :: (argc: s32, argv: **u8) -> s32 {
     if !ShortcutTest() { print("shortcut test failed\n"); return 75 }
     if !ScanTest() { print("scan/snapshot test failed\n"); return 66 }
     if !GroupingTest() { print("process grouping test failed\n"); return 72 }
+    if !AppUsageTest() { print("application usage test failed\n"); return 76 }
+    if !GpuSharesTest() { print("GPU shares test failed\n"); return 77 }
+    if !ExternalGpuTest() { print("external GPU test failed\n"); return 78 }
     if !SortTest() { print("sort test failed\n"); return 67 }
     if !FormatTest() { print("format test failed\n"); return 68 }
     if !SignalTest() { print("signal binding test failed\n"); return 69 }

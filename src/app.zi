@@ -1,6 +1,7 @@
 using UI :: #import "Widgets";
 using Model :: #import "model";
 Apps :: #import "windows";
+Gpu :: #import "gpu_processes";
 Tables :: #import "data_views/TableView";
 Theme :: #import "kryon/Theme";
 SystemTheme :: #import "kryon/SystemTheme";
@@ -64,7 +65,10 @@ BUTTON_WIDTH :: 120.0;
 PAD :: 10.0;
 
 COLUMNS :: Model.COLUMNS;
-APP_COLUMNS :: 2;
+APP_COLUMNS :: 5;
+APP_COLUMN_CPU :: 2;
+APP_COLUMN_MEMORY :: 3;
+APP_COLUMN_GPU :: 4;
 // Ten-digit PIDs, percentages, elapsed times and adaptive byte values fit in
 // 16 bytes; process/group names use the model's bounded 32-byte capacity.
 CELL_WIDTH :: 16;
@@ -77,8 +81,8 @@ MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES + Model.MAX_PROCESSES / 2;
 process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Memory"};
 process_fractions: [5]float32 = .{0.40, 0.12, 0.10, 0.16, 0.22};
 process_widths: [COLUMNS]s32;
-app_columns: [2]string = .{"Task", "Status"};
-app_fractions: [2]float32 = .{0.76, 0.24};
+app_columns: [5]string = .{"Task", "Status", "CPU", "Memory", "GPU"};
+app_fractions: [5]float32 = .{0.40, 0.20, 0.11, 0.17, 0.12};
 app_widths: [APP_COLUMNS]s32;
 widths_for: float32;
 
@@ -118,11 +122,19 @@ text_stores_a: CellText;
 text_stores_b: CellText;
 text_active: s32;
 
-// Window manager task lists, also in two generations.
+// Window manager task lists, also in two generations. CPU, memory and GPU are
+// the window's whole process tree (see Model.AppUsages).
 AppText :: struct {
     list: Apps.AppList
     cell: [Apps.MAX_WINDOWS * APP_COLUMNS]string
+    cpu: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
+    mem: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
+    gpu: [Apps.MAX_WINDOWS * CELL_WIDTH]u8
 }
+
+app_pids: [Apps.MAX_WINDOWS]s32;
+no_external_gpus: [1]Model.GpuExternal;
+app_usage: [Apps.MAX_WINDOWS]Model.AppUsage;
 
 app_stores_a: AppText;
 app_stores_b: AppText;
@@ -442,12 +454,37 @@ AppStatus :: (pid: s32) -> string {
 RebuildApps :: (store: *AppText) {
     Apps.AppsRefresh(*store.list)
     app_selected_row = -1
-    if store.list.count > 0 {
-        for index: 0..store.list.count - 1 {
+    count := store.list.count
+    if count > 0 {
+        for index: 0..count - 1 { app_pids[index] = store.list.windows[index].pid }
+        shares := Gpu.GpuSharesCurrent()
+        Model.AppUsages(Model.Current(), app_pids[0:count], shares.pids[0:shares.count],
+            shares.percent[0:shares.count], Gpu.GpuSharesReady(), app_usage[0:count])
+        for index: 0..count - 1 {
             entry := *store.list.windows[index]
+            usage := *app_usage[index]
+            base := index * APP_COLUMNS
+            text_base := index * CELL_WIDTH
             if entry.id == app_selected_window { app_selected_row = index }
-            store.cell[index * APP_COLUMNS] = TextView(entry.title[0:entry.title_count])
-            store.cell[index * APP_COLUMNS + 1] = AppStatus(entry.pid)
+            store.cell[base] = TextView(entry.title[0:entry.title_count])
+            store.cell[base + 1] = AppStatus(entry.pid)
+            if usage.found {
+                store.cell[base + APP_COLUMN_CPU] = Model.FormatCpu(usage.cpu_percent,
+                    store.cpu[text_base:text_base + CELL_WIDTH])
+                store.cell[base + APP_COLUMN_MEMORY] = Model.FormatBytes(usage.memory_bytes,
+                    store.mem[text_base:text_base + CELL_WIDTH])
+            } else {
+                store.cell[base + APP_COLUMN_CPU] = "-"
+                store.cell[base + APP_COLUMN_MEMORY] = "-"
+            }
+            if !usage.gpu_known {
+                store.cell[base + APP_COLUMN_GPU] = "n/a"
+            } else if usage.found {
+                store.cell[base + APP_COLUMN_GPU] = Model.FormatCpu(usage.gpu_percent,
+                    store.gpu[text_base:text_base + CELL_WIDTH])
+            } else {
+                store.cell[base + APP_COLUMN_GPU] = "-"
+            }
         }
     }
     if app_selected_row < 0 { app_selected_window = 0 }
@@ -497,7 +534,7 @@ ColumnWidths :: (width: float32) {
     }
     for column: 0..APP_COLUMNS - 1 {
         value := cast(s32)(usable * app_fractions[column])
-        if value < 60 { value = 60 }
+        if value < 40 { value = 40 }
         app_widths[column] = value
     }
 }
@@ -1219,7 +1256,18 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         if now_ms < 0 && frames_since_refresh >= REFRESH_FALLBACK_FRAMES { refreshed = true }
     }
     if refresh_requested { refreshed = true }
+    // Non-blocking: drains the GPU helper, and starts or stops it with the
+    // tabs that show GPU data (Applications and Performance).
+    Gpu.GpuSharesPoll(current_tab == TAB_APPLICATIONS || current_tab == TAB_PERFORMANCE)
     if refreshed {
+        // NVIDIA cards have no sysfs counters; the helper's whole-card
+        // readings stand in for them while it runs.
+        if Gpu.GpuSharesReady() {
+            readings := Gpu.GpuDevicesCurrent()
+            Model.SetExternalGpus(readings.items[0:readings.count])
+        } else {
+            Model.SetExternalGpus(no_external_gpus[0:0])
+        }
         Model.Refresh()
         BuildApps()
         frames_since_refresh = 0

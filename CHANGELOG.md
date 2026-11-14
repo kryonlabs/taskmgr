@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Applications tab shows CPU, memory and GPU use for each window, counting
+  the window's whole process tree (a browser's helper processes count toward
+  the browser). GPU use comes from NVIDIA's driver through a small helper that
+  runs only while the Applications or Performance tab is open; other GPUs
+  show `n/a`.
+
+### Fixed
+
+- The Performance tab shows GPU usage and VRAM for NVIDIA cards instead of
+  `n/a`.
+
 ## [0.1.2] - 2026-11-13
 
 ### Changed

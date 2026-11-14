@@ -58,6 +58,9 @@ Process :: struct {
     name_count: s32
     name: [NAME_CAPACITY]u8
     state: u8
+    // Parent PID from /proc/<pid>/stat field 4; it sits in the padding before
+    // cpu_percent, so the snapshot row does not grow.
+    ppid: s32
     cpu_percent: float64
     memory_bytes: u64
     ticks: u64
@@ -242,8 +245,8 @@ ParsePidName :: (name_bytes: []u8) -> s32 {
 }
 
 // Parses /proc/<pid>/stat: the command name sits between the first '(' and the
-// last ')'; after it come the state and the numbered fields, where utime is
-// field 14, stime is field 15, num_threads is field 20, and rss is field 24.
+// last ')'; after it come the state and the numbered fields, where ppid is
+// field 4, utime is field 14, stime is field 15, num_threads is field 20, and rss is field 24.
 #program_export
 ParseStat :: (content: []u8, process: *Process) -> bool {
     EnsureTiming()
@@ -285,6 +288,7 @@ ParseStat :: (content: []u8, process: *Process) -> bool {
             digits += 1
         }
         if digits == 0 { return false }
+        if !negative && field == 4 { process.ppid = cast(s32)value }
         if !negative && field == 14 { utime = value }
         if !negative && field == 15 { stime = value }
         if !negative && field == 20 { process.threads = cast(s32)value }
@@ -403,16 +407,122 @@ DrmPath :: (card: []u8, leaf: string, output: []u8) -> string {
     return TextView(output[0:length])
 }
 
+// A whole-card reading from outside sysfs (NVIDIA's NVML, through the GPU
+// helper), matched to a DRM card by PCI address because NVIDIA's driver
+// publishes no gpu_busy_percent or mem_info_vram_* files. A negative busy or
+// a non-positive vram_total marks that counter unsupported.
+GpuExternal :: struct {
+    domain: u32
+    bus: u32
+    slot: u32
+    busy: s64
+    vram_used: s64
+    vram_total: s64
+}
+
+external_gpus: [MAX_GPUS]GpuExternal;
+external_gpu_count: s32;
+
+// Replaces the outside readings the next Refresh may use; an empty slice
+// removes them, so a stopped source never leaves stale values behind.
+#program_export
+SetExternalGpus :: (readings: []GpuExternal) {
+    external_gpu_count = 0
+    for reading: readings {
+        if external_gpu_count >= MAX_GPUS { break }
+        external_gpus[external_gpu_count] = reading
+        external_gpu_count += 1
+    }
+}
+
+#program_export
+ExternalGpuFor :: (domain: u32, bus: u32, slot: u32) -> s32 {
+    if external_gpu_count <= 0 { return -1 }
+    for index: 0..external_gpu_count - 1 {
+        reading := *external_gpus[index]
+        if reading.domain == domain && reading.bus == bus && reading.slot == slot { return index }
+    }
+    return -1
+}
+
+HexDigit :: (byte: u8) -> s32 {
+    if byte >= 48 && byte <= 57 { return cast(s32)(byte - 48) }
+    if byte >= 97 && byte <= 102 { return cast(s32)(byte - 87) }
+    if byte >= 65 && byte <= 70 { return cast(s32)(byte - 55) }
+    return -1
+}
+
+// Parses one hexadecimal field of a PCI address and the separator after it.
+HexField :: (text: []u8, start: s32, separator: u8) -> (value: u32, next: s32, ok: bool) {
+    cursor := start
+    value: u32 = 0
+    total := cast(s32)text.count
+    while cursor < total && cursor - start < 8 {
+        digit := HexDigit(text[cursor])
+        if digit < 0 { break }
+        value = value * 16 + cast(u32)digit
+        cursor += 1
+    }
+    if cursor == start { return 0, cursor, false }
+    if separator != 0 {
+        if cursor >= total || text[cursor] != separator { return 0, cursor, false }
+        cursor += 1
+    }
+    return value, cursor, true
+}
+
+// Reads PCI_SLOT_NAME=dddd:bb:ss.f from a sysfs uevent file.
+#program_export
+PciSlotFromUevent :: (content: []u8) -> (domain: u32, bus: u32, slot: u32, function: u32, ok: bool) {
+    label := "PCI_SLOT_NAME="
+    limit := cast(s32)content.count
+    label_count := cast(s32)label.count
+    index: s32 = 0
+    while index < limit {
+        if index > 0 && content[index - 1] != 10 {
+            index += 1
+            continue
+        }
+        matched := true
+        offset: s32 = 0
+        while offset < label_count {
+            if index + offset >= limit || content[index + offset] != label[offset] {
+                matched = false
+                break
+            }
+            offset += 1
+        }
+        if matched {
+            domain, after_domain, domain_ok := HexField(content, index + offset, 58)
+            bus, after_bus, bus_ok := HexField(content, after_domain, 58)
+            slot, after_slot, slot_ok := HexField(content, after_bus, 46)
+            function, after_function, function_ok := HexField(content, after_slot, 0)
+            if domain_ok && bus_ok && slot_ok && function_ok {
+                return domain, bus, slot, function, true
+            }
+            return 0, 0, 0, 0, false
+        }
+        index += 1
+    }
+    return 0, 0, 0, 0, false
+}
+
 // Adds one card's independent sysfs buffers, keeping card order stable. A zero
 // used counter is valid. Missing totals and inconsistent used > total pairs are
 // unsupported, never interpreted as fully used.
 #program_export
 AddGpuCounters :: (snapshot: *Snapshot, card_index: s32,
     busy_text: []u8, used_text: []u8, total_text: []u8) {
+    AddGpuValues(snapshot, card_index, FirstNumber(busy_text), FirstNumber(used_text),
+        FirstNumber(total_text))
+}
+
+// The numeric form of AddGpuCounters; negative values are missing counters.
+#program_export
+AddGpuValues :: (snapshot: *Snapshot, card_index: s32, busy: s64, used: s64, total: s64) {
     if card_index < 0 || card_index >= GPU_CARD_LIMIT || snapshot.gpu_count >= MAX_GPUS { return }
     device: GpuDevice
     device.card_index = card_index
-    busy := FirstNumber(busy_text)
     if busy >= 0 {
         if busy > 100 { busy = 100 }
         device.busy_supported = true
@@ -420,8 +530,6 @@ AddGpuCounters :: (snapshot: *Snapshot, card_index: s32,
         snapshot.gpu_percent += device.busy_percent
         snapshot.gpu_supported_count += 1
     }
-    used := FirstNumber(used_text)
-    total := FirstNumber(total_text)
     if used >= 0 && total > 0 && used <= total {
         device.vram_supported = true
         device.vram_used = cast(u64)used
@@ -457,12 +565,15 @@ GpuVramPercent :: (device: *GpuDevice) -> float64 {
 
 // Samples every DRM card that exposes standard Linux sysfs counters. Each
 // counter has its own buffer: reading total must not overwrite used before it
-// is parsed (the previous alias made every adapter appear 100% full).
+// is parsed (the previous alias made every adapter appear 100% full). A card
+// with none of those files (NVIDIA's driver) uses the external reading for
+// its PCI address when one was set.
 ReadGpuStats :: (snapshot: *Snapshot) {
     directory := Files.OpenDirectory("/sys/class/drm")
     busy_buffer: [128]u8
     used_buffer: [128]u8
     total_buffer: [128]u8
+    uevent_buffer: [512]u8
     path: [160]u8
     while true {
         entry := Files.NextDirectoryEntry(*directory)
@@ -473,6 +584,20 @@ ReadGpuStats :: (snapshot: *Snapshot) {
         busy_length := ReadSmall(DrmPath(card, "gpu_busy_percent", path[:]), busy_buffer[:])
         used_length := ReadSmall(DrmPath(card, "mem_info_vram_used", path[:]), used_buffer[:])
         total_length := ReadSmall(DrmPath(card, "mem_info_vram_total", path[:]), total_buffer[:])
+        if busy_length <= 0 && used_length <= 0 && total_length <= 0 && external_gpu_count > 0 {
+            uevent_length := ReadSmall(DrmPath(card, "uevent", path[:]), uevent_buffer[:])
+            if uevent_length > 0 {
+                domain, bus, slot, function, ok := PciSlotFromUevent(uevent_buffer[0:uevent_length])
+                external := -1
+                if ok && function == 0 { external = ExternalGpuFor(domain, bus, slot) }
+                if external >= 0 {
+                    reading := *external_gpus[external]
+                    AddGpuValues(snapshot, card_index, reading.busy, reading.vram_used,
+                        reading.vram_total)
+                    continue
+                }
+            }
+        }
         busy_text: []u8 = busy_buffer[0:0]
         used_text: []u8 = used_buffer[0:0]
         total_text: []u8 = total_buffer[0:0]
@@ -649,6 +774,122 @@ FindProcess :: (snapshot: *Snapshot, pid: s32) -> s32 {
         }
     }
     return -1
+}
+
+// Resource use behind one Applications row: the window's own process plus
+// every descendant that no nearer listed window owns. found is false when the
+// window publishes no PID or that PID is not in the snapshot.
+AppUsage :: struct {
+    found: bool
+    gpu_known: bool
+    processes: s32
+    cpu_percent: float64
+    memory_bytes: u64
+    gpu_percent: float64
+}
+
+// Deep enough for shells, launchers and browser helpers; also stops a
+// corrupted parent chain from looping.
+MAX_TREE_DEPTH :: 64;
+
+// Snapshot indices ordered by PID, and the window slot each process directly
+// represents (-1 for none). Rebuilt by AppUsages; never retained across calls.
+pid_order: [MAX_PROCESSES]s32;
+owner_slot: [MAX_PROCESSES]s32;
+
+// /proc lists PIDs in ascending order, so this insertion sort is linear in
+// practice and still correct when the order differs.
+BuildPidOrder :: (snapshot: *Snapshot) {
+    count := snapshot.count
+    if count <= 0 { return }
+    for slot: 0..count - 1 {
+        key := slot
+        key_pid := snapshot.processes[key].pid
+        position := slot - 1
+        while position >= 0 && snapshot.processes[pid_order[position]].pid > key_pid {
+            pid_order[position + 1] = pid_order[position]
+            position -= 1
+        }
+        pid_order[position + 1] = key
+    }
+}
+
+IndexOfPid :: (snapshot: *Snapshot, pid: s32) -> s32 {
+    low: s32 = 0
+    high := snapshot.count - 1
+    while low <= high {
+        middle := low + (high - low) / 2
+        index := pid_order[middle]
+        value := snapshot.processes[index].pid
+        if value == pid { return index }
+        if value < pid { low = middle + 1 } else { high = middle - 1 }
+    }
+    return -1
+}
+
+// Sums CPU share, resident memory and GPU share per window. Each process
+// counts once, toward the nearest ancestor (itself included) whose PID owns a
+// listed window, so a browser started from a terminal is the browser's, not
+// the terminal's. Windows that share a PID show the same totals. GPU_PIDS and
+// GPU_PERCENT are per-process GPU shares; GPU_KNOWN false means no per-process
+// GPU source exists and every gpu_known stays false.
+#program_export
+AppUsages :: (snapshot: *Snapshot, window_pids: []s32, gpu_pids: []s32,
+    gpu_percent: []float64, gpu_known: bool, output: []AppUsage) {
+    count := cast(s32)window_pids.count
+    if count > cast(s32)output.count { count = cast(s32)output.count }
+    if count <= 0 { return }
+    for slot: 0..count - 1 {
+        output[slot] = AppUsage.{}
+        output[slot].gpu_known = gpu_known
+    }
+    if snapshot.count <= 0 { return }
+    BuildPidOrder(snapshot)
+    for index: 0..snapshot.count - 1 { owner_slot[index] = -1 }
+    for slot: 0..count - 1 {
+        pid := window_pids[slot]
+        if pid <= 0 { continue }
+        index := IndexOfPid(snapshot, pid)
+        if index >= 0 && owner_slot[index] < 0 { owner_slot[index] = slot }
+    }
+    gpu_count := cast(s32)gpu_pids.count
+    if gpu_count > cast(s32)gpu_percent.count { gpu_count = cast(s32)gpu_percent.count }
+    for index: 0..snapshot.count - 1 {
+        cursor := index
+        slot: s32 = -1
+        depth: s32 = 0
+        while cursor >= 0 && depth < MAX_TREE_DEPTH {
+            if owner_slot[cursor] >= 0 {
+                slot = owner_slot[cursor]
+                break
+            }
+            parent := snapshot.processes[cursor].ppid
+            if parent <= 0 { break }
+            cursor = IndexOfPid(snapshot, parent)
+            depth += 1
+        }
+        if slot < 0 { continue }
+        process := *snapshot.processes[index]
+        usage := *output[slot]
+        usage.found = true
+        usage.processes += 1
+        usage.cpu_percent += process.cpu_percent
+        usage.memory_bytes += process.memory_bytes
+        if gpu_known && gpu_count > 0 {
+            for entry: 0..gpu_count - 1 {
+                if gpu_pids[entry] == process.pid { usage.gpu_percent += gpu_percent[entry] }
+            }
+        }
+    }
+    // A second window of the same process repeats the first one's totals.
+    for slot: 0..count - 1 {
+        pid := window_pids[slot]
+        if pid <= 0 { continue }
+        index := IndexOfPid(snapshot, pid)
+        if index < 0 { continue }
+        first := owner_slot[index]
+        if first >= 0 && first != slot { output[slot] = output[first] }
+    }
 }
 
 // Samples /proc into the live snapshot. CPU percentages use compact PID/tick
