@@ -2,6 +2,11 @@
 Model :: #import "model";
 mode: s32;
 terminated: s32;
+stamp: s64 = 1000000000;
+counter: s64 = 100000000;
+identity: s64 = 1;
+#program_export
+SampleNanos :: () -> s64 { return stamp }
 #program_export
 Capture :: () -> s32 {
     if mode == 1 { return -1 }
@@ -16,6 +21,11 @@ TaskAt :: (index: s32, fields: []s64, name: []u8, user: []u8) -> s32 {
     fields[1] = 7
     fields[2] = 4
     fields[3] = ifx index == 0 then 12 else -1
+    fields[4] = ifx index == 0 then counter else 0
+    fields[5] = identity + cast(s64)index
+    fields[6] = 0
+    if mode == 8 { fields[4] = -1 }
+    if mode == 9 { fields[0] = 200 + index }
     name[0] = cast(u8)(65 + index % 26)
     if mode == 5 { name[0] = 90 }
     name[1] = 0
@@ -76,6 +86,49 @@ main :: () -> s32 {
     mode = 7
     Model.Refresh()
     if Model.Current().count != 1024 || Model.Current().processes[1023].pid != 1123 { return 17 }
+    // Start a new task pair; first reading is unavailable, then a real delta.
+    mode = 9
+    stamp = 2000000000
+    Model.Refresh()
+    if Model.Current().processes[0].cpu_available { return 18 }
+    stamp += 1000000000
+    counter += 250000000
+    Model.Refresh()
+    snapshot := Model.Current()
+    if !snapshot.cpu_available || snapshot.cpu_measured_tasks != 2 ||
+       !snapshot.processes[0].cpu_available || snapshot.processes[0].cpu_percent != 25.0 ||
+       snapshot.processes[1].cpu_percent != 0 || snapshot.cpu_percent != 25.0 { return 19 }
+    order: [2]s32
+    Model.SortOrder(snapshot, order[:], Model.COLUMN_CPU, -1)
+    if order[0] != 0 { return 20 }
+    // Same clock, changed identity and counter rollback never carry a delta.
+    Model.Refresh()
+    if Model.Current().cpu_available { return 21 }
+    stamp += 1000000000
+    identity = 20
+    Model.Refresh()
+    if Model.Current().cpu_available { return 22 }
+    stamp += 1000000000
+    counter = 0
+    Model.Refresh()
+    if Model.Current().processes[0].cpu_available { return 23 }
+    stamp += 1000000000
+    Model.Refresh()
+    if !Model.Current().processes[0].cpu_available || Model.Current().processes[0].cpu_percent != 0 { return 24 }
+    mode = 8
+    stamp += 1000000000
+    Model.Refresh()
+    if Model.Current().cpu_available { return 25 }
+    mode = 1
+    Model.Refresh()
+    if Model.Current().cpu_available { return 26 }
+    mode = 9
+    stamp += 1000000000
+    Model.Refresh()
+    if Model.Current().cpu_available { return 27 }
+    // More than one core of measured task CPU must not be clamped in totals.
+    total_text: [24]u8
+    if Model.FormatAccountedCpu(125.5, total_text[:]) != "125.5" { return 28 }
     print("taskmgr Taiji adapter tests passed\n")
     return 0
 }

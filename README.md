@@ -105,16 +105,37 @@ Kryon's software surface/pixmap and monotonic clock host capabilities.
 Guest PID values identify Dis tasks. `Est. Memory` is the guest's Dis
 stack/module estimate in KiB, converted to bytes for display; it is not RSS.
 The status and Performance memory reading is the real main allocator pool in
-bytes against its configured limit, not total system RAM. CPU percentages,
-CPU time, Linux windows, GPU and unsupported counters are explicitly unavailable.
+bytes against its configured limit, not total system RAM. `CPU %` uses real
+cumulative task CPU nanoseconds divided
+by elapsed captured monotonic nanoseconds; 100% means one core. The first sample,
+new/reused task identity, counter reset, unavailable counter or nonpositive elapsed
+time displays `n/a` until a comparable next sample. Idle tasks then show real zero.
+`Task CPU` is the sum of comparable live task deltas, not whole-machine CPU:
+new/exited/unmeasured tasks and kernel/idle work are excluded. It can exceed 100%
+when guest execution threads run concurrently. Performance shows the comparable
+task count. CPU time, Linux windows, GPU and other unsupported counters remain
+explicitly unavailable. The guest requires the additive `SampleNanos` capability
+and seven-field `TaskAt` CPU/incarnation/timestamp-error extension from the matching
+emulator. Timestamp uncertainty must be smaller than the interval. A task delta
+above 100% is accepted as saturation only when its excess fits within the measured
+capture uncertainty; larger inconsistencies display `n/a`.
 The guest has no shell launch or group termination. End Process targets only
 the selected captured guest PID through the native `/prog/PID/ctl` operation.
 Refresh storage and task count are bounded; failed captures clear visible rows.
 
 `make taiji-test` runs 1,000 service-fixture refreshes, unit conversion,
 unavailable/stale handling and selected-PID control through a ZX bundle.
-Actual guest GUI lifecycle and the default 32 MiB pool measurement are separate
-integration tests owned by the Taiji launcher task.
+For the real guest CPU model test, build `make taiji-cpu-live` with the same
+`TAIJIOS_TASK_MODULES`, then run `python3 scripts/guest-cpu-test.py /path/to/taijios`.
+It starts a disposable 32 MiB guest, measures its busy ZX task beside an owned
+sleeper, and checks real CPU sorting. No guest task is fabricated or controlled.
+`python3 scripts/guest-lifecycle-test.py /path/to/taijios` mounts only the built
+artifact in a disposable private-Xvfb guest and runs the canonical Taiji CPU and
+GUI lifecycle suite. `--emu /path/to/emu` can select the runtime owner's verified
+candidate. This does not install the app. Actual installation/menu integration
+remains with the Taiji launcher owner. See the CPU follow-up in
+[tests/PERFORMANCE.md](tests/PERFORMANCE.md) for local lifecycle and paired renderer
+results at the default 32 MiB pool.
 
 ## Performance measurements
 
@@ -142,8 +163,17 @@ time. That callback measurement does not include final pixel presentation.
 The native profile measures process CPU and input-to-observed-tab-redraw time.
 Both GUI scripts create a scrubbed private Xvfb and stop only their own processes.
 
+`make taiji-performance` also builds `build/guest-profile-retained.zx`, selecting
+Kryon's `RunRetained` with the same shared app and observations. Production Taiji
+uses that retained surface; the normal profile remains a comparison test.
+`make taiji-retained-test` builds an uninstrumented lifecycle test artifact at
+`build/taskmgr-retained-test.zx`. These explicit test targets do not install
+anything. Use `--cycles 6 --seconds 90 --require-cpu`
+with the guest profiler for the paired table/dialog workload.
+
 See [the measured baseline and limitations](tests/PERFORMANCE.md). Model work is
-substantially faster; guest full-frame raster/presentation still dominates GUI
-CPU and latency. The native 30 MiB RSS test remains an enforced regression
+substantially faster. Retained guest rendering reduced idle CPU by 73% and the
+table/dialog workload CPU by 67% in one paired local run; those measurements are
+not a universal performance guarantee. The native 30 MiB RSS test remains an enforced regression
 threshold; repeated measurements can exceed it as anonymous huge-page residency
 and file-backed library pages vary. A raised measurement limit is not a cap pass.

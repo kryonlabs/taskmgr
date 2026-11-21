@@ -4,6 +4,11 @@
 
 ### Added
 
+- Display measured Taiji task CPU percentages from cumulative scheduler CPU and
+  captured monotonic time, with per-task validity and incarnation-safe deltas.
+- Use Kryon's retained Taiji surface after matching table/dialog pixels and
+  validating refresh, selected-task control, resize and reopen at 32 MiB.
+
 - Run the shared Task Manager interface on TaijiOS ZX with real guest tasks,
   allocator memory, selected-task control and bounded platform sampling.
 - Clicking an application expands it to the processes it owns, each with its

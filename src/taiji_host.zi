@@ -11,5 +11,5 @@ Draw :: (frame: Surface.Frame) {
 
 #program_export
 main :: () -> s32 {
-    return Surface.Run(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
+    return Surface.RunRetained(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
 }

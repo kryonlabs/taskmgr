@@ -3,6 +3,7 @@ Surface :: #import "kryon/host/surface";
 Clock :: #import "kryon/Clock";
 Tasks :: #import "taijios_tasks";
 App :: #import "app";
+Model :: #import "model";
 #import "kryon/session"
 #import "kryon/tree"
 frames: s32;
@@ -11,6 +12,8 @@ Draw :: (frame: Surface.Frame) {
     start := Clock.Milliseconds()
     unused App.Frame(session, TreeRootBounds(session))
     elapsed := Clock.Milliseconds() - start
+    snapshot := Model.Current()
+    print("FRAME_CPU valid=% measured=% percent=%\n", cast(s32)snapshot.cpu_available, snapshot.cpu_measured_tasks, snapshot.cpu_percent)
     pool: [4]s64
     code := Tasks.PoolAt(0, pool[:])
     frames += 1
@@ -18,5 +21,9 @@ Draw :: (frame: Surface.Frame) {
 }
 #program_export
 main :: () -> s32 {
+#if #defined(TASKMGR_RETAINED) {
+    return Surface.RunRetained(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
+} else {
     return Surface.Run(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
+}
 }

@@ -152,8 +152,8 @@ CellText :: struct {
     cell: [MAX_DISPLAY_ROWS * COLUMNS]string
     name: [MAX_DISPLAY_ROWS * NAME_WIDTH]u8
     pid: [MAX_DISPLAY_ROWS * PID_CELL_WIDTH]u8
-#if !#defined(TASKMGR_TAIJI) {
     cpu: [MAX_DISPLAY_ROWS * CPU_CELL_WIDTH]u8
+#if !#defined(TASKMGR_TAIJI) {
     time: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
 }
     mem: [MAX_DISPLAY_ROWS * MEMORY_CELL_WIDTH]u8
@@ -494,6 +494,10 @@ RebuildOrder :: (store: *CellText) {
         }
         #if #defined(TASKMGR_TAIJI) {
         store.cell[base + Model.COLUMN_CPU] = "n/a"
+        if entry.cpu_available {
+            store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
+                store.cpu[index * CPU_CELL_WIDTH:(index + 1) * CPU_CELL_WIDTH])
+        }
         store.cell[base + Model.COLUMN_CPU_TIME] = "n/a"
         } else {
         store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
@@ -1316,11 +1320,26 @@ PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: strin
 PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
     #if #defined(TASKMGR_TAIJI) {
         bytes: [32]u8
-        Label(session, 449, "Guest main pool allocated (CPU unavailable)", area, font)
+        Label(session, 449, "Guest main pool allocated", area, font)
         reading := "n/a"
         if Model.Current().memory_available { reading = Model.FormatBytes(Model.Current().memory_used, bytes[:]) }
         Label(session, 450, reading,
             .{area.x, area.y + 40.0, area.width, 30.0}, font)
+        measured_bytes: [16]u8
+        all_bytes: [16]u8
+        count_bytes: [80]u8
+        count_parts: [4]string = .{"Comparable tasks: ",
+            Number.FormatInteger(cast(s64)Model.Current().cpu_measured_tasks, measured_bytes[:]),
+            " / ", Number.FormatInteger(cast(s64)Model.Current().count, all_bytes[:])}
+        Label(session, 453, JoinAll(count_parts[:], count_bytes[:]),
+            .{area.x, area.y + 160.0, area.width, 30.0}, font)
+        cpu_bytes: [24]u8
+        cpu_reading := "n/a (sampling)"
+        if Model.Current().cpu_available { cpu_reading = Model.FormatAccountedCpu(Model.Current().cpu_percent, cpu_bytes[:]) }
+        Label(session, 451, "Measured task CPU % (one core = 100%)",
+            .{area.x, area.y + 90.0, area.width, 30.0}, font)
+        Label(session, 452, cpu_reading,
+            .{area.x, area.y + 125.0, area.width, 30.0}, font)
     } else {
     snapshot := Model.Current()
         half := (area.width - PAD) / 2.0
@@ -1429,7 +1448,15 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
     processes_parts: [2]string = .{"Processes: ", Number.FormatInteger(cast(s64)snapshot.count, count_line[:])}
     cpu_line: [16]u8
     cpu_text: [48]u8
-    cpu_parts: [3]string = .{"CPU Usage: ", Model.FormatCpu(snapshot.cpu_percent, cpu_line[:]), "%"}
+    cpu_value := ""
+    cpu_caption := "CPU Usage: "
+#if #defined(TASKMGR_TAIJI) {
+    cpu_value = Model.FormatAccountedCpu(snapshot.cpu_percent, cpu_line[:])
+    cpu_caption = "Task CPU: "
+} else {
+    cpu_value = Model.FormatCpu(snapshot.cpu_percent, cpu_line[:])
+}
+    cpu_parts: [3]string = .{cpu_caption, cpu_value, "%"}
     used_line: [32]u8
     total_line: [32]u8
     memory_text: [96]u8
@@ -1439,8 +1466,15 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
         JoinAll(cpu_parts[:], cpu_text[:]), JoinAll(memory_parts[:], memory_text[:])}
     if !snapshot.processes_available { texts[0] = "Processes: n/a" }
     if !snapshot.cpu_available { texts[1] = "CPU: n/a" }
+#if #defined(TASKMGR_TAIJI) {
+    if !snapshot.cpu_available { texts[1] = "Task CPU: n/a" }
+}
     if !snapshot.memory_available { texts[2] = "Memory: n/a" }
+#if #defined(TASKMGR_TAIJI) {
+    widths: [3]float32 = .{0.24, 0.32, 0.44}
+} else {
     widths: [3]float32 = .{0.24, 0.24, 0.52}
+}
     x := bounds.x + 4.0
     for index: 0..2 {
         width := (bounds.width - 16.0) * widths[index]
@@ -1491,6 +1525,7 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
             palette_text = theme.colors.foreground
             palette_border = theme.colors.border
             palette_base = palette_background
+            process_columns[2] = "CPU %"
             process_columns[4] = "Est. Memory"
             group_processes = false
         }

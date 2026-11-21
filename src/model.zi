@@ -1324,3 +1324,16 @@ EndProcessGroup :: (source: *Snapshot, group: *Process) -> GroupEndResult {
     }
     return result
 }
+
+// Sum of comparable guest task deltas; multiple guest execution threads may
+// exceed one core. This is deliberately distinct from native machine CPU.
+#program_export
+FormatAccountedCpu :: (percent: float64, output: []u8) -> string {
+    tenths := cast(s64)(percent * 10.0 + 0.5)
+    if tenths < 0 { return "n/a" }
+    digits: [24]u8
+    length := Append(output, 0, Number.FormatInteger(tenths / 10, digits[:]))
+    length = Append(output, length, ".")
+    length = Append(output, length, Number.FormatInteger(tenths % 10, digits[:]))
+    return TextView(output[0:length])
+}

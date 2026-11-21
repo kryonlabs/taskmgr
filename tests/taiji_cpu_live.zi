@@ -1,0 +1,37 @@
+// Real default-pool guest probe: our ZX task burns CPU beside an owned sleeper.
+// No process is fabricated or controlled here; the disposable runner owns both.
+Model :: #import "model";
+Clock :: #import "kryon/Clock";
+#import "std/byte_text_linux"
+#program_export
+main :: () -> s32 {
+    Model.Refresh()
+    initial := Model.Current()
+    if initial.cpu_available || !initial.memory_available || initial.memory_total != 33554432 { return 3 }
+    deadline := Clock.Milliseconds() + 300
+    work: u64 = 1
+    while Clock.Milliseconds() < deadline {
+        for index: 0..255 { work = work * 1664525 + 1013904223 }
+    }
+    Model.Refresh()
+    snapshot := Model.Current()
+    busy: s32 = 0
+    asleep: s32 = 0
+    order: [Model.MAX_PROCESSES]s32
+    for index: 0..snapshot.count - 1 {
+        row := *snapshot.processes[index]
+        if row.cpu_available {
+            print("TASK_CPU_ROW pid=% name=% percent=%\n", row.pid,
+                TextView(row.name[0:row.name_count]), row.cpu_percent)
+            if row.cpu_percent > 5 { busy += 1 }
+            if row.name_count == 5 && row.name[0] == 83 && row.name[1] == 108 &&
+               row.name[2] == 101 && row.name[3] == 101 && row.name[4] == 112 &&
+               row.cpu_percent == 0 { asleep += 1 }
+        }
+    }
+    if !snapshot.cpu_available || busy < 1 || asleep < 1 { return 1 }
+    Model.SortOrder(snapshot, order[:], Model.COLUMN_CPU, -1)
+    if snapshot.processes[order[0]].cpu_percent <= 5 { return 2 }
+    print("TASK_CPU_LIVE_OK measured=% sum=% checksum=%\n", snapshot.cpu_measured_tasks, snapshot.cpu_percent, work)
+    return 0
+}

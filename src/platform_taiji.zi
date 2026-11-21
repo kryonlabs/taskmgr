@@ -1,9 +1,30 @@
 // Only typed guest capabilities: no host filesystem or Linux process calls.
 using Types :: #import "model_types";
 Tasks :: #import "taijios_tasks";
+Cpu :: #import "guest_cpu";
+CpuRow :: struct {
+    pid: s32
+    reading: Cpu.Reading
+}
+// Two bounded generations; TaskAt is in guest PID order. Binary lookup avoids
+// cross-row aliasing when tasks appear/disappear between captures.
+previous: [MAX_PROCESSES]CpuRow;
+next: [MAX_PROCESSES]CpuRow;
+previous_count: s32;
+Previous :: (pid: s32) -> Cpu.Reading {
+    low: s32 = 0
+    high := previous_count
+    while low < high {
+        middle := low + (high - low) / 2
+        if previous[middle].pid < pid { low = middle + 1 } else { high = middle }
+    }
+    if low < previous_count && previous[low].pid == pid { return previous[low].reading }
+    return .{}
+}
 VisibleRowEqual :: (left: *Process, right: *Process) -> bool {
     if left.pid != right.pid || left.state != right.state || left.name_count != right.name_count ||
-       left.memory_available != right.memory_available || left.memory_bytes != right.memory_bytes { return false }
+       left.memory_available != right.memory_available || left.memory_bytes != right.memory_bytes ||
+       left.cpu_available != right.cpu_available || left.cpu_percent != right.cpu_percent { return false }
     if left.name_count > 0 {
         for index: 0..left.name_count - 1 { if left.name[index] != right.name[index] { return false } }
     }
@@ -12,31 +33,50 @@ VisibleRowEqual :: (left: *Process, right: *Process) -> bool {
 
 #program_export
 Sample :: (target: *Snapshot) -> bool {
-    previous_count := target.count
+    old_count := target.count
     changed := !target.processes_available
     target.count = 0
     target.processes_available = false
     target.cpu_available = false
+    target.cpu_percent = 0
+    target.cpu_measured_tasks = 0
     target.memory_available = false
     target.memory_used = 0
     target.memory_total = 0
     target.handles = -1
     target.threads = -1
     count := Tasks.Capture()
-    if count < 0 || count > MAX_PROCESSES { return previous_count != 0 || !changed }
+    if count < 0 || count > MAX_PROCESSES {
+        previous_count = 0
+        return old_count != 0 || !changed
+    }
     target.processes_available = true
-    fields: [4]s64
+    stamp := Tasks.SampleNanos()
+    fields: [7]s64
     name: [64]u8
     user: [64]u8
     for index: 0..count - 1 {
         if Tasks.TaskAt(index, fields[:], name[:], user[:]) != 0 {
             target.count = 0
             target.processes_available = false
-            return previous_count != 0 || !changed
+            previous_count = 0
+            target.cpu_available = false
+            target.cpu_percent = 0
+            target.cpu_measured_tasks = 0
+            return old_count != 0 || !changed
         }
         entry: Process
         if fields[0] <= 0 || fields[0] > 2147483647 { continue }
         entry.pid = cast(s32)fields[0]
+        reading: Cpu.Reading = .{fields[4], stamp, fields[5], fields[6]}
+        percent, valid := Cpu.Percent(Previous(entry.pid), reading)
+        entry.cpu_available = valid
+        entry.cpu_percent = percent
+        if valid {
+            target.cpu_percent += percent
+            target.cpu_measured_tasks += 1
+        }
+        next[target.count] = .{entry.pid, reading}
         entry.group_count = 1
         entry.state = STATE_SLEEPING
         if fields[2] == 4 { entry.state = STATE_RUNNING }
@@ -48,11 +88,16 @@ Sample :: (target: *Snapshot) -> bool {
         }
         entry.memory_available = fields[3] >= 0 && fields[3] <= 18014398509481983
         if entry.memory_available { entry.memory_bytes = cast(u64)fields[3] * 1024 }
-        if target.count >= previous_count || !VisibleRowEqual(*target.processes[target.count], *entry) { changed = true }
+        if target.count >= old_count || !VisibleRowEqual(*target.processes[target.count], *entry) { changed = true }
         target.processes[target.count] = entry
         target.count += 1
     }
-    if previous_count != target.count { changed = true }
+    previous_count = target.count
+    if previous_count > 0 {
+        for index: 0..previous_count - 1 { previous[index] = next[index] }
+    }
+    target.cpu_available = target.cpu_measured_tasks > 0
+    if old_count != target.count { changed = true }
     if Tasks.PoolAt(0, fields[:]) == 0 && fields[0] >= 0 && fields[1] >= 0 {
         target.memory_available = true
         target.memory_used = cast(u64)fields[0]

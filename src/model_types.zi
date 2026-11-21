@@ -53,6 +53,7 @@ Process :: struct {
     name: [NAME_CAPACITY]u8
     state: u8
     memory_available: bool
+    cpu_available: bool
     // Parent PID from /proc/<pid>/stat field 4; it sits in the padding before
     // cpu_percent, so the snapshot row does not grow.
     ppid: s32
@@ -98,6 +99,9 @@ GpuDevice :: struct {
 }
 
 Snapshot :: struct {
+#if #defined(TASKMGR_TAIJI) {
+    cpu_measured_tasks: s32
+}
     processes_available: bool
     cpu_available: bool
     memory_available: bool

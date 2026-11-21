@@ -1,0 +1,42 @@
+Cpu :: #import "guest_cpu";
+#program_export
+main :: () -> s32 {
+    initial: Cpu.Reading = .{100, 1000, 7, 0}
+    value, valid := Cpu.Percent(.{}, initial)
+    if valid { return 1 }
+    value, valid = Cpu.Percent(initial, .{350, 2000, 7, 0})
+    if !valid || value != 25.0 { return 2 }
+    value, valid = Cpu.Percent(initial, .{100, 2000, 7, 0})
+    if !valid || value != 0 { return 3 }
+    value, valid = Cpu.Percent(initial, .{1100, 2000, 7, 0})
+    if !valid || value != 100 { return 4 }
+    value, valid = Cpu.Percent(initial, .{50, 2000, 7, 0})
+    if valid { return 5 }
+    value, valid = Cpu.Percent(initial, .{350, 2000, 8, 0})
+    if valid { return 6 }
+    value, valid = Cpu.Percent(initial, .{350, 1000, 7, 0})
+    if valid { return 7 }
+    value, valid = Cpu.Percent(initial, .{350, 999, 7, 0})
+    if valid { return 8 }
+    value, valid = Cpu.Percent(initial, .{-1, 2000, 7, 0})
+    if valid { return 9 }
+    value, valid = Cpu.Percent(initial, .{1101, 2000, 7, 0})
+    if valid { return 10 }
+    value, valid = Cpu.Percent(.{9223372036854775700, 9223372036854775700, 1, 0},
+        .{9223372036854775750, 9223372036854775800, 1, 0})
+    if !valid || value != 50 { return 11 }
+    // Exact measured skew bounds admit saturation, never a larger excess.
+    value, valid = Cpu.Percent(.{100, 1000, 7, 2}, .{1105, 2000, 7, 3})
+    if !valid || value != 100 { return 12 }
+    value, valid = Cpu.Percent(.{100, 1000, 7, 2}, .{1106, 2000, 7, 3})
+    if valid { return 13 }
+    value, valid = Cpu.Percent(.{100, 1000, 7, -1}, .{350, 2000, 7, 0})
+    if valid { return 14 }
+    value, valid = Cpu.Percent(.{100, 1000, 7, 500}, .{350, 2000, 7, 500})
+    if valid { return 15 }
+    value, valid = Cpu.Percent(.{100, 1000, 7, 9223372036854775807},
+        .{350, 2000, 7, 9223372036854775807})
+    if valid { return 16 }
+    print("taskmgr guest CPU arithmetic tests passed\n")
+    return 0
+}

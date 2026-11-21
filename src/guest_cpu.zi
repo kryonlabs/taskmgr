@@ -1,0 +1,29 @@
+// Delta arithmetic shared by the guest adapter and deterministic fixtures.
+#scope_export
+Reading :: struct {
+    counter: s64
+    clock: s64
+    identity: s64
+    error: s64
+}
+// CPU and monotonic wall counters must use the same unit. Identity identifies
+// a task incarnation, not merely its reusable PID. Never invent a first delta.
+Percent :: (before: Reading, after: Reading) -> (value: float64, valid: bool) {
+    if before.identity <= 0 || before.identity != after.identity ||
+       before.counter < 0 || after.counter < before.counter ||
+       before.clock < 0 || after.clock <= before.clock ||
+       before.error < 0 || after.error < 0 { return .{0, false} }
+    elapsed := after.clock - before.clock
+    used := after.counter - before.counter
+    // Each CPU read falls within its captured timestamp error. Require a
+    // useful interval and add bounds by subtraction to avoid signed overflow.
+    if before.error >= elapsed || after.error >= elapsed - before.error { return .{0, false} }
+    error := before.error + after.error
+    if used > elapsed {
+        if used - elapsed > error { return .{0, false} }
+        // One task has at most one executing interpreter thread. Saturation
+        // is valid only within the host's measured capture-skew interval.
+        return .{100, true}
+    }
+    return .{cast(float64)used * 100.0 / cast(float64)elapsed, true}
+}
