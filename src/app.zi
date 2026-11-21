@@ -152,14 +152,17 @@ CellText :: struct {
     cell: [MAX_DISPLAY_ROWS * COLUMNS]string
     name: [MAX_DISPLAY_ROWS * NAME_WIDTH]u8
     pid: [MAX_DISPLAY_ROWS * PID_CELL_WIDTH]u8
+#if !#defined(TASKMGR_TAIJI) {
     cpu: [MAX_DISPLAY_ROWS * CPU_CELL_WIDTH]u8
     time: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+}
     mem: [MAX_DISPLAY_ROWS * MEMORY_CELL_WIDTH]u8
 }
 
 text_stores_a: CellText;
 text_stores_b: CellText;
 text_active: s32;
+last_table_revision: u64;
 
 // Window manager task lists, also in two generations. A window row totals its
 // process tree (see Model.AppUsages); an expanded window lists those
@@ -167,6 +170,7 @@ text_active: s32;
 #if !#defined(TASKMGR_TAIJI) {
 APP_ROWS :: Apps.MAX_WINDOWS + Model.MAX_PROCESSES;
 TASK_WIDTH :: Apps.TITLE_CAPACITY + 8;
+PROCESS_TASK_WIDTH :: NAME_WIDTH + 20;
 
 AppRow :: struct {
     window: s32
@@ -178,10 +182,11 @@ AppText :: struct {
     rows: [APP_ROWS]AppRow
     row_count: s32
     cell: [APP_ROWS * APP_COLUMNS]string
-    task: [APP_ROWS * TASK_WIDTH]u8
-    cpu: [APP_ROWS * CELL_WIDTH]u8
-    mem: [APP_ROWS * CELL_WIDTH]u8
-    gpu: [APP_ROWS * CELL_WIDTH]u8
+    task: [Apps.MAX_WINDOWS * TASK_WIDTH]u8
+    process_task: [Model.MAX_PROCESSES * PROCESS_TASK_WIDTH]u8
+    cpu: [APP_ROWS * CPU_CELL_WIDTH]u8
+    mem: [APP_ROWS * MEMORY_CELL_WIDTH]u8
+    gpu: [APP_ROWS * CPU_CELL_WIDTH]u8
 }
 
 app_pids: [Apps.MAX_WINDOWS]s32;
@@ -487,16 +492,19 @@ RebuildOrder :: (store: *CellText) {
             store.cell[base + Model.COLUMN_PID] = Number.FormatInteger(cast(s64)entry.pid,
                 store.pid[index * PID_CELL_WIDTH:(index + 1) * PID_CELL_WIDTH])
         }
+        #if #defined(TASKMGR_TAIJI) {
+        store.cell[base + Model.COLUMN_CPU] = "n/a"
+        store.cell[base + Model.COLUMN_CPU_TIME] = "n/a"
+        } else {
         store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
             store.cpu[index * CPU_CELL_WIDTH:(index + 1) * CPU_CELL_WIDTH])
         store.cell[base + Model.COLUMN_CPU_TIME] = Model.FormatCpuTime(entry.ticks,
             store.time[cell:cell + CELL_WIDTH])
-        store.cell[base + Model.COLUMN_MEMORY] = Model.FormatBytes(entry.memory_bytes,
-            store.mem[index * MEMORY_CELL_WIDTH:(index + 1) * MEMORY_CELL_WIDTH])
-        if Platform.IsGuest() {
-            store.cell[base + Model.COLUMN_CPU] = "n/a"
-            store.cell[base + Model.COLUMN_CPU_TIME] = "n/a"
-            if !entry.memory_available { store.cell[base + Model.COLUMN_MEMORY] = "n/a" }
+        }
+        store.cell[base + Model.COLUMN_MEMORY] = "n/a"
+        if !Platform.IsGuest() || entry.memory_available {
+            store.cell[base + Model.COLUMN_MEMORY] = Model.FormatBytes(entry.memory_bytes,
+                store.mem[index * MEMORY_CELL_WIDTH:(index + 1) * MEMORY_CELL_WIDTH])
         }
     }
 }
@@ -592,10 +600,9 @@ CollectGpuShares :: (snapshot: *Model.Snapshot, sample: bool) {
 // Fills the CPU, Memory and GPU cells of ROW.
 UsageCells :: (store: *AppText, row: s32, cpu: float64, memory: u64, gpu: float64) {
     base := row * APP_COLUMNS
-    text := row * CELL_WIDTH
-    store.cell[base + APP_COLUMN_CPU] = Model.FormatCpu(cpu, store.cpu[text:text + CELL_WIDTH])
-    store.cell[base + APP_COLUMN_MEMORY] = Model.FormatBytes(memory, store.mem[text:text + CELL_WIDTH])
-    store.cell[base + APP_COLUMN_GPU] = Model.FormatCpu(gpu, store.gpu[text:text + CELL_WIDTH])
+    store.cell[base + APP_COLUMN_CPU] = Model.FormatCpu(cpu, store.cpu[row * CPU_CELL_WIDTH:(row + 1) * CPU_CELL_WIDTH])
+    store.cell[base + APP_COLUMN_MEMORY] = Model.FormatBytes(memory, store.mem[row * MEMORY_CELL_WIDTH:(row + 1) * MEMORY_CELL_WIDTH])
+    store.cell[base + APP_COLUMN_GPU] = Model.FormatCpu(gpu, store.gpu[row * CPU_CELL_WIDTH:(row + 1) * CPU_CELL_WIDTH])
 }
 
 AddWindowRow :: (store: *AppText, window: s32) {
@@ -608,7 +615,7 @@ AddWindowRow :: (store: *AppText, window: s32) {
     if usage.processes > 0 { marker = ifx WindowExpanded(entry.id) then "▾ " else "▸ " }
     parts: [2]string = .{marker, TextView(entry.title[0:entry.title_count])}
     base := row * APP_COLUMNS
-    store.cell[base] = JoinAll(parts[:], store.task[row * TASK_WIDTH:(row + 1) * TASK_WIDTH])
+    store.cell[base] = JoinAll(parts[:], store.task[window * TASK_WIDTH:(window + 1) * TASK_WIDTH])
     store.cell[base + 1] = AppStatus(entry.pid)
     if usage.found {
         UsageCells(store, row, usage.cpu_percent, usage.memory_bytes, usage.gpu_percent)
@@ -634,7 +641,7 @@ AddProcessRow :: (store: *AppText, window: s32, process_index: s32) {
     parts: [5]string = .{"      ", TextView(name[0:process.name_count]), "  (",
         Number.FormatInteger(cast(s64)process.pid, digits[:]), ")"}
     base := row * APP_COLUMNS
-    store.cell[base] = JoinAll(parts[:], store.task[row * TASK_WIDTH:(row + 1) * TASK_WIDTH])
+    store.cell[base] = JoinAll(parts[:], store.process_task[process_index * PROCESS_TASK_WIDTH:(process_index + 1) * PROCESS_TASK_WIDTH])
     store.cell[base + 1] = Model.StateName(process.state)
     UsageCells(store, row, process.cpu_percent, process.memory_bytes, GpuShareFor(process.pid))
     if store.list.windows[window].id == app_selected_window && process.pid == app_selected_pid {
@@ -1307,15 +1314,14 @@ PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: strin
 }
 
 PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
-    if Platform.IsGuest() {
+    #if #defined(TASKMGR_TAIJI) {
         bytes: [32]u8
         Label(session, 449, "Guest main pool allocated (CPU unavailable)", area, font)
         reading := "n/a"
         if Model.Current().memory_available { reading = Model.FormatBytes(Model.Current().memory_used, bytes[:]) }
         Label(session, 450, reading,
             .{area.x, area.y + 40.0, area.width, 30.0}, font)
-        return
-    }
+    } else {
     snapshot := Model.Current()
         half := (area.width - PAD) / 2.0
         info_height: float32 = 92.0
@@ -1408,6 +1414,7 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         InfoRow(session, 471, kernel_area, 0, "Total", Model.FormatKilobytesBytes(kernel_total, j[:]), font)
         InfoRow(session, 473, kernel_area, 1, "Paged", Model.FormatKilobytesBytes(details.kernel_paged_kb, k[:]), font)
         InfoRow(session, 475, kernel_area, 2, "Nonpaged", Model.FormatKilobytesBytes(details.kernel_nonpaged_kb, l[:]), font)
+    }
 }
 
 // The status bar: process count, CPU usage and memory in use, each in its
@@ -1524,8 +1531,9 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         if now_ms >= 0 { last_refresh_ms = now_ms } else { last_refresh_ms = 0 }
         refresh_requested = false
     }
-    if refreshed || pending_sort {
+    if pending_sort || (refreshed && Model.TableRevision() != last_table_revision) {
         BuildOrder()
+        last_table_revision = Model.TableRevision()
         pending_sort = false
     }
     if apps_layout_changed && !refreshed {

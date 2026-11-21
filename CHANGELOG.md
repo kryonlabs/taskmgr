@@ -13,6 +13,10 @@
 
 ### Changed
 
+- Bound process grouping and stable sorting work at full task capacity, reuse
+  unchanged guest table text and reduce fixed text storage without changing
+  refresh rates, task limits or the shared interface.
+
 - CPU and GPU shares show one decimal below 10% (`0.4`) instead of rounding
   light use to `00`.
 - The Applications GPU column appears only when a per-process GPU source has

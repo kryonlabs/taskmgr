@@ -1,0 +1,22 @@
+// Explicit test host: unchanged app UI with timing/pool observations.
+Surface :: #import "kryon/host/surface";
+Clock :: #import "kryon/Clock";
+Tasks :: #import "taijios_tasks";
+App :: #import "app";
+#import "kryon/session"
+#import "kryon/tree"
+frames: s32;
+Draw :: (frame: Surface.Frame) {
+    session: Session = .{frame.slot, frame.epoch}
+    start := Clock.Milliseconds()
+    unused App.Frame(session, TreeRootBounds(session))
+    elapsed := Clock.Milliseconds() - start
+    pool: [4]s64
+    code := Tasks.PoolAt(0, pool[:])
+    frames += 1
+    print("FRAME_PERF frame=% declaration_ms=% pool=% high=% valid=%\n", frames, elapsed, pool[0], pool[2], code)
+}
+#program_export
+main :: () -> s32 {
+    return Surface.Run(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
+}

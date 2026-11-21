@@ -115,3 +115,35 @@ Refresh storage and task count are bounded; failed captures clear visible rows.
 unavailable/stale handling and selected-PID control through a ZX bundle.
 Actual guest GUI lifecycle and the default 32 MiB pool measurement are separate
 integration tests owned by the Taiji launcher task.
+
+## Performance measurements
+
+Grouping uses a bounded hash index; raw and group order use stable merge sort.
+The native 2,048-task and guest 1,024-task limits are unchanged. Guest sampling
+still runs at the selected refresh rate, but unchanged process rows reuse their
+formatted order. Pool readings update independently. Text storage keeps both
+retained generations and sizes native window titles separately from process names.
+
+```sh
+make performance-test
+python3 scripts/native-performance.py build/taskmgr-desktop
+TAIJIOS_TASK_MODULES=/path/to/taijios/appl/cmd make taiji-performance
+python3 scripts/guest-performance.py /path/to/taijios build/guest-profile.zx --seconds 30
+```
+
+The model workload groups and sorts a deterministic full-capacity fixture three
+times; fixture values never appear in the app. `TASKMGR_PERF_SMALL` builds the
+same workload with 128 rows for comparison with the earlier quadratic algorithm.
+Run `build/performance-test.zx` through the actual guest's `zxrun` with
+`-p main=32M`. The guest profile is an explicit test entry calling the normal
+`App.Frame` at the same surface size and idle interval. It reports declaration
+time, real allocator bytes/high water, emulator CPU, and input-to-next-callback
+time. That callback measurement does not include final pixel presentation.
+The native profile measures process CPU and input-to-observed-tab-redraw time.
+Both GUI scripts create a scrubbed private Xvfb and stop only their own processes.
+
+See [the measured baseline and limitations](tests/PERFORMANCE.md). Model work is
+substantially faster; guest full-frame raster/presentation still dominates GUI
+CPU and latency. The native 30 MiB RSS test remains an enforced regression
+threshold; repeated measurements can exceed it as anonymous huge-page residency
+and file-backed library pages vary. A raised measurement limit is not a cap pass.

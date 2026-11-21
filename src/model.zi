@@ -16,6 +16,9 @@ using Types :: #import "model_types";
 state_names: [7]string = .{"Running", "Sleeping", "Waiting", "Stopped", "Zombie", "Idle", "Other"};
 
 snapshot: Snapshot;
+table_revision: u64;
+#program_export
+TableRevision :: () -> u64 { return table_revision }
 // Only PID/ticks plus the three system counters are needed from the preceding
 // sample to calculate CPU deltas. This replaces a second full raw snapshot.
 previous_pids: [MAX_PROCESSES]s32;
@@ -41,6 +44,9 @@ clock_ticks: float64;
 page_bytes: u64;
 timing_ready: bool;
 grouped_snapshot: GroupedSnapshot;
+// Reused bounded workspace; grouping keeps first-seen order and verifies collisions.
+group_slots: [MAX_PROCESSES * 2]s32;
+sort_scratch: [MAX_PROCESSES]s32;
 
 #program_export
 Current :: () -> *Snapshot {
@@ -530,21 +536,30 @@ SameProcessGroup :: (left: *Process, right: *Process) -> bool {
 BuildGroupedSnapshot :: (source: *Snapshot, target: *GroupedSnapshot) {
     target.count = 0
     if source.count <= 0 { return }
+    slots: s32 = 2
+    while slots < source.count * 2 { slots *= 2 }
+    for slot: 0..slots - 1 { group_slots[slot] = -1 }
     for index: 0..source.count - 1 {
         entry := *source.processes[index]
-        group: s32 = -1
-        if target.count > 0 {
-            for candidate: 0..target.count - 1 {
-                representative := target.groups[candidate].process_index
-                if representative >= 0 && representative < source.count &&
-                   SameProcessGroup(*source.processes[representative], entry) {
-                    group = candidate
-                    break
-                }
+        hash: u64 = 14695981039346656037
+        if IsCodexProcessName(entry.name[0:entry.name_count]) {
+            hash = 0
+        } else if entry.name_count > 0 {
+            for byte: 0..entry.name_count - 1 {
+                hash = (hash ^ cast(u64)LowerByte(entry.name[byte])) * 1099511628211
             }
+        }
+        slot := cast(s32)(hash & cast(u64)(slots - 1))
+        group := group_slots[slot]
+        while group >= 0 {
+            representative := target.groups[group].process_index
+            if SameProcessGroup(*source.processes[representative], entry) { break }
+            slot = (slot + 1) & (slots - 1)
+            group = group_slots[slot]
         }
         if group < 0 {
             group = target.count
+            group_slots[slot] = group
             target.groups[group].process_index = index
             target.groups[group].group_count = 1
             target.groups[group].cpu_percent = entry.cpu_percent
@@ -792,10 +807,12 @@ AppUsages :: (snapshot: *Snapshot, window_pids: []s32, gpu_pids: []s32,
 #program_export
 Refresh :: () {
 #if #defined(TASKMGR_TAIJI) {
-    Guest.Sample(*snapshot)
-    BuildGroupedSnapshot(*snapshot, *grouped_snapshot)
+    if Guest.Sample(*snapshot) { table_revision += 1 }
+    // Guest UI has no group operation; avoid building an unused second view.
+    grouped_snapshot.count = 0
 } else {
 
+    table_revision += 1
     EnsureTiming()
     snapshot.processes_available = true
     snapshot.cpu_available = false
@@ -1069,54 +1086,87 @@ CompareRows :: (snapshot: *Snapshot, left: s32, right: s32, column: s32) -> s32 
     return CompareProcesses(*snapshot.processes[left], *snapshot.processes[right], column)
 }
 
-// Fills ORDER with a stable sort of the snapshot rows for COLUMN. Direction 1
-// sorts ascending, -1 descending, and 0 leaves the natural /proc order.
+// Compare aggregates directly; avoid copying two complete Process records for
+// every group comparison. Codex aliases use the same name as GroupProcess.
+CompareGroups :: (source: *Snapshot, grouped: *GroupedSnapshot, left: s32, right: s32,
+    column: s32) -> s32 {
+    a := *grouped.groups[left]
+    b := *grouped.groups[right]
+    if column == COLUMN_NAME {
+        first := *source.processes[a.process_index]
+        second := *source.processes[b.process_index]
+        canonical: [5]u8 = .{99, 111, 100, 101, 120}
+        left_name := first.name[0:first.name_count]
+        right_name := second.name[0:second.name_count]
+        if IsCodexProcessName(left_name) { left_name = canonical[:] }
+        if IsCodexProcessName(right_name) { right_name = canonical[:] }
+        return CompareName(left_name, right_name)
+    }
+    if column == COLUMN_PID {
+        return CompareProcesses(*source.processes[a.process_index], *source.processes[b.process_index], column)
+    }
+    if column == COLUMN_CPU {
+        if a.cpu_percent < b.cpu_percent { return -1 }
+        if a.cpu_percent > b.cpu_percent { return 1 }
+    } else if column == COLUMN_CPU_TIME {
+        if a.ticks < b.ticks { return -1 }
+        if a.ticks > b.ticks { return 1 }
+    } else if column == COLUMN_MEMORY {
+        if a.memory_bytes < b.memory_bytes { return -1 }
+        if a.memory_bytes > b.memory_bytes { return 1 }
+    }
+    return 0
+}
+
+// Bottom-up stable merge sort has bounded O(n log n) comparisons, including
+// reverse PID/memory order. Scratch is shared by these sequential UI operations.
+SortIndices :: (source: *Snapshot, grouped: *GroupedSnapshot, order: []s32,
+    count: s32, column: s32, direction: s32, groups: bool) {
+    if count > 0 { for index: 0..count - 1 { order[index] = index } }
+    if column < 0 || column >= COLUMNS || direction == 0 || count < 2 { return }
+    width: s32 = 1
+    while width < count {
+        start: s32 = 0
+        while start < count {
+            middle := start + width
+            if middle > count { middle = count }
+            end := middle + width
+            if end > count { end = count }
+            left := start
+            right := middle
+            for output: start..end - 1 {
+                take_left := right >= end
+                if left < middle && right < end {
+                    comparison: s32
+                    if groups { comparison = CompareGroups(source, grouped, order[left], order[right], column) }
+                    else { comparison = CompareRows(source, order[left], order[right], column) }
+                    if direction < 0 { comparison = -comparison }
+                    take_left = comparison <= 0
+                }
+                if take_left && left < middle { sort_scratch[output] = order[left]; left += 1 }
+                else { sort_scratch[output] = order[right]; right += 1 }
+            }
+            start = end
+        }
+        for index: 0..count - 1 { order[index] = sort_scratch[index] }
+        width *= 2
+    }
+}
+
+// Direction 1 sorts ascending, -1 descending; 0 preserves snapshot order.
 #program_export
 SortOrder :: (snapshot: *Snapshot, order: []s32, column: s32, direction: s32) {
     count := snapshot.count
     if count > cast(s32)order.count { count = cast(s32)order.count }
-    if count > 0 {
-        for index: 0..count - 1 { order[index] = index }
-    }
-    if column < 0 || column >= COLUMNS || direction == 0 || count < 2 { return }
-    for slot: 1..count - 1 {
-        key := order[slot]
-        position := slot - 1
-        while position >= 0 {
-            comparison := CompareRows(snapshot, order[position], key, column)
-            if direction < 0 { comparison = -comparison }
-            if comparison <= 0 { break }
-            order[position + 1] = order[position]
-            position -= 1
-        }
-        order[position + 1] = key
-    }
+    SortIndices(snapshot, *grouped_snapshot, order, count, column, direction, false)
 }
 
-// Stable ordering for compact aggregate groups.
 #program_export
 SortGroupOrder :: (source: *Snapshot, grouped: *GroupedSnapshot, order: []s32,
     column: s32, direction: s32) {
     count := grouped.count
     if count > cast(s32)order.count { count = cast(s32)order.count }
-    if count > 0 {
-        for index: 0..count - 1 { order[index] = index }
-    }
-    if column < 0 || column >= COLUMNS || direction == 0 || count < 2 { return }
-    for slot: 1..count - 1 {
-        key := order[slot]
-        key_process := GroupProcess(source, *grouped.groups[key])
-        position := slot - 1
-        while position >= 0 {
-            other := GroupProcess(source, *grouped.groups[order[position]])
-            comparison := CompareProcesses(*other, *key_process, column)
-            if direction < 0 { comparison = -comparison }
-            if comparison <= 0 { break }
-            order[position + 1] = order[position]
-            position -= 1
-        }
-        order[position + 1] = key
-    }
+    SortIndices(source, grouped, order, count, column, direction, true)
 }
 
 #program_export

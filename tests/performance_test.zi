@@ -1,0 +1,55 @@
+// Deterministic full-capacity model workload; never displayed as guest data.
+Model :: #import "model";
+Number :: #import "std/number_text";
+#if #defined(TASKMGR_TAIJI) {
+Clock :: #import "kryon/Clock";
+} else {
+Clock :: #import "std/timer_linux";
+}
+source: Model.Snapshot;
+groups: Model.GroupedSnapshot;
+order: [Model.MAX_PROCESSES]s32;
+Now :: () -> s64 {
+#if #defined(TASKMGR_TAIJI) {
+return Clock.Milliseconds()
+} else {
+return Clock.MonotonicNanoseconds() / 1000
+}
+}
+#program_export
+main :: () -> s32 {
+    source.count = Model.MAX_PROCESSES
+#if #defined(TASKMGR_PERF_SMALL) {
+    source.count = 128
+}
+    for index: 0..source.count - 1 {
+        entry := *source.processes[index]
+        entry.pid = index + 1
+        entry.memory_bytes = cast(u64)(source.count - index) * 1024
+        entry.cpu_percent = cast(float64)(index % 100)
+        entry.group_count = 1
+        entry.name_count = 8
+        for byte: 0..3 { entry.name[byte] = 97 }
+        value := index
+        for digit: 0..3 { entry.name[7 - digit] = cast(u8)(48 + value % 10); value /= 10 }
+    }
+    start := Now()
+    for pass: 0..2 { Model.BuildGroupedSnapshot(*source, *groups) }
+    grouped_ms := Now() - start
+    start = Now()
+    for pass: 0..2 { Model.SortOrder(*source, order[:], Model.COLUMN_MEMORY, 1) }
+    raw_ms := Now() - start
+    if order[0] != source.count - 1 || order[source.count - 1] != 0 { return 1 }
+    start = Now()
+    for pass: 0..2 { Model.SortGroupOrder(*source, *groups, order[:], Model.COLUMN_MEMORY, 1) }
+    sort_ms := Now() - start
+    if order[0] != source.count - 1 || groups.count != source.count { return 2 }
+    #if #defined(TASKMGR_TAIJI) {
+    units := "ms"
+    } else {
+    units := "us"
+    }
+    print("MODEL_PERF rows=% passes=3 units=% group=% raw_sort=% group_sort=% checksum=%\n",
+        source.count, units, grouped_ms, raw_ms, sort_ms, source.processes[order[0]].pid)
+    return 0
+}

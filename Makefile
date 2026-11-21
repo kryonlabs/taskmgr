@@ -4,7 +4,7 @@ ZIRAN ?= ./scripts/ziran.sh
 export LDLIBS += -lX11
 SOURCES := $(wildcard src/*.zi) $(wildcard tests/*.zi) ziran.toml ziran.lock scripts/ziran.sh Makefile
 
-.PHONY: all build run check test x11-test memory-test shot package clean
+.PHONY: all build run check test x11-test memory-test shot package clean performance-test taiji-performance
 
 all: build
 
@@ -21,8 +21,13 @@ build/model-test: $(SOURCES)
 	$(ZIRAN) build --project --target=c --exe --entry model_test:main -o build/model-test-c tests/model_test.zi
 	cp build/model-test-c/model_test build/model-test
 
-test: build/model-test
+build/ordering-test: $(SOURCES)
+	$(ZIRAN) build --project --target=c --exe --entry ordering_test:main -o build/ordering-test-c tests/ordering_test.zi
+	cp build/ordering-test-c/ordering_test build/ordering-test
+
+test: build/model-test build/ordering-test
 	./build/model-test
+	./build/ordering-test
 
 build/windows-test: $(SOURCES)
 	$(ZIRAN) build --project --target=c --exe --entry windows_test:main -o build/windows-test-c tests/windows_test.zi
@@ -62,3 +67,16 @@ taiji-test:
 	    --bind taijios_tasks:Terminate=taiji_model_test:Terminate \
 	    -o build/taiji-model-test.zx tests/taiji_model_test.zi
 	$(ZIRAN) run build/taiji-model-test.zx
+
+# Deterministic full-capacity grouping/sort benchmark (three passes each).
+build/performance-test: $(SOURCES)
+	$(ZIRAN) build --project --target=c --exe --entry performance_test:main -o build/performance-test-c tests/performance_test.zi
+	cp build/performance-test-c/performance_test build/performance-test
+
+performance-test: build/performance-test
+	./build/performance-test
+
+# Explicit guest test artifacts; neither target installs or modifies the menu.
+taiji-performance:
+	$(ZIRAN) bundle --project --define TASKMGR_TAIJI --module-path "$(TAIJIOS_TASK_MODULES)" --bind-host taijios_tasks --bind-host kryon/pixmap --entry performance_test:main -o build/performance-test.zx tests/performance_test.zi
+	$(ZIRAN) bundle --project --define TASKMGR_TAIJI --module-path "$(TAIJIOS_TASK_MODULES)" --bind-host taijios_tasks --bind-host kryon/pixmap --entry guest_profile:main -o build/guest-profile.zx tests/guest_profile.zi

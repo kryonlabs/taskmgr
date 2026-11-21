@@ -1,8 +1,19 @@
 // Only typed guest capabilities: no host filesystem or Linux process calls.
 using Types :: #import "model_types";
 Tasks :: #import "taijios_tasks";
+VisibleRowEqual :: (left: *Process, right: *Process) -> bool {
+    if left.pid != right.pid || left.state != right.state || left.name_count != right.name_count ||
+       left.memory_available != right.memory_available || left.memory_bytes != right.memory_bytes { return false }
+    if left.name_count > 0 {
+        for index: 0..left.name_count - 1 { if left.name[index] != right.name[index] { return false } }
+    }
+    return true
+}
+
 #program_export
-Sample :: (target: *Snapshot) {
+Sample :: (target: *Snapshot) -> bool {
+    previous_count := target.count
+    changed := !target.processes_available
     target.count = 0
     target.processes_available = false
     target.cpu_available = false
@@ -12,7 +23,7 @@ Sample :: (target: *Snapshot) {
     target.handles = -1
     target.threads = -1
     count := Tasks.Capture()
-    if count < 0 || count > MAX_PROCESSES { return }
+    if count < 0 || count > MAX_PROCESSES { return previous_count != 0 || !changed }
     target.processes_available = true
     fields: [4]s64
     name: [64]u8
@@ -21,7 +32,7 @@ Sample :: (target: *Snapshot) {
         if Tasks.TaskAt(index, fields[:], name[:], user[:]) != 0 {
             target.count = 0
             target.processes_available = false
-            return
+            return previous_count != 0 || !changed
         }
         entry: Process
         if fields[0] <= 0 || fields[0] > 2147483647 { continue }
@@ -37,12 +48,15 @@ Sample :: (target: *Snapshot) {
         }
         entry.memory_available = fields[3] >= 0 && fields[3] <= 18014398509481983
         if entry.memory_available { entry.memory_bytes = cast(u64)fields[3] * 1024 }
+        if target.count >= previous_count || !VisibleRowEqual(*target.processes[target.count], *entry) { changed = true }
         target.processes[target.count] = entry
         target.count += 1
     }
+    if previous_count != target.count { changed = true }
     if Tasks.PoolAt(0, fields[:]) == 0 && fields[0] >= 0 && fields[1] >= 0 {
         target.memory_available = true
         target.memory_used = cast(u64)fields[0]
         target.memory_total = cast(u64)fields[1]
     }
+    return changed
 }
