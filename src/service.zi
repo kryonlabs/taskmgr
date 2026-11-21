@@ -1,0 +1,241 @@
+// Host service for portable Task Manager frontends (e.g., Werkzeug).
+// Runs in the native host process and exposes bounded /proc snapshots and
+// process control over the `taskmgr.v1` service protocol.
+Json :: #import "std/json_scan";
+#import "std/vec"
+#import "std/text_buffer"
+#import "std/byte_text_linux"
+#import "std/c_string"
+#import "kryon/app_files"
+
+#if !#defined(PLATFORM_WEB) && !#defined(ANDROID_BUILD) {
+    Model :: #import "model";
+    using Types :: #import "model_types";
+}
+
+MAX_ROWS :: 160;
+
+Context :: struct {
+    initialized: bool
+}
+
+reply_buf: [131072]u8;
+
+Number :: (request: string, name: string) -> s32 {
+    at := Json.FieldAt(request, 0, name)
+    if at < 0 { return 0 }
+    value := Json.ReadNumber(request, at)
+    if !value.valid || value.value < -2147483647.0 || value.value > 2147483647.0 { return 0 }
+    return cast(s32)value.value
+}
+
+Text :: (request: string, name: string, out: []u8) -> string {
+    count := Json.ReadStringText(request, Json.FieldAt(request, 0, name), out)
+    return ifx count >= 0 && count < out.count then TextView(out[:count]) else ""
+}
+
+Finish :: (context: *Context, bytes: Vec(u8)) -> string {
+    unused context
+    count := cast(s64)bytes.count
+    if count >= reply_buf.count { count = reply_buf.count - 1 }
+    {
+        slice := VecSlice(bytes, 0, cast(usize)count)
+        for index: 0..count - 1 { reply_buf[index] = slice[index] }
+    }
+    reply_buf[count] = cast(u8)0
+    VecFree(bytes)
+    return TextView(reply_buf[:count])
+}
+
+ReplyLine :: (context: *Context, prefix: string, message: string) -> string {
+    bytes: Vec(u8)
+    BuilderPrint(*bytes, "%\t%\n", prefix, message)
+    return Finish(context, bytes)
+}
+
+#if !#defined(PLATFORM_WEB) && !#defined(ANDROID_BUILD) {
+    order_scratch: [MAX_PROCESSES]s32;
+
+    AsciiLower :: (byte: u8) -> u8 {
+        if byte >= cast(u8)65 && byte <= cast(u8)90 { return byte + cast(u8)32 }
+        return byte
+    }
+
+    ContainsFold :: (haystack: string, needle: string) -> bool {
+        if needle.count == 0 { return true }
+        if needle.count > haystack.count { return false }
+        limit := haystack.count - needle.count
+        for start: 0..limit {
+            matched := true
+            for offset: 0..needle.count - 1 {
+                if AsciiLower(haystack[start + offset]) != AsciiLower(needle[offset]) {
+                    matched = false
+                    break
+                }
+            }
+            if matched { return true }
+        }
+        return false
+    }
+
+    SanitizeName :: (bytes: *Vec(u8), name: string) {
+        for byte: name {
+            if byte == cast(u8)9 || byte == cast(u8)10 || byte == cast(u8)13 {
+                unused VecPush(bytes.*, cast(u8)32)
+            } else {
+                unused VecPush(bytes.*, byte)
+            }
+        }
+    }
+
+    AppendHistory :: (bytes: *Vec(u8), tag: string, kind: s32) {
+        samples: [HISTORY_LENGTH]float32
+        values := Model.History(kind, samples[:])
+        BuilderPrint(bytes, "%", tag)
+        for index: 0..values.count - 1 {
+            tenths := cast(s64)(values[index] * 10.0 + 0.5)
+            if tenths < 0 { tenths = 0 }
+            if tenths > 1000 { tenths = 1000 }
+            BuilderPrint(bytes, "\t%", tenths)
+        }
+        BuilderPrint(bytes, "\n")
+    }
+
+    SnapshotReply :: (context: *Context, request: string) -> string {
+        sort_column := Number(request, "sort")
+        if sort_column < 0 || sort_column >= COLUMNS { sort_column = COLUMN_CPU }
+        desc := Number(request, "desc") != 0
+        grouped := Number(request, "grouped") != 0
+        refresh := Number(request, "refresh") != 0
+        filter_bytes: [128]u8
+        filter := Text(request, "filter", filter_bytes[:])
+        if !context.initialized || refresh {
+            Model.Refresh()
+            context.initialized = true
+        }
+        snapshot := Model.Current()
+        bytes: Vec(u8)
+        cpu_x10 := cast(s64)(snapshot.cpu_percent * 10.0 + 0.5)
+        kern_x10 := cast(s64)(snapshot.kernel_percent * 10.0 + 0.5)
+        BuilderPrint(*bytes, "ok\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\t%\n",
+            ifx snapshot.processes_available then 1 else 0,
+            ifx snapshot.cpu_available then 1 else 0,
+            ifx snapshot.memory_available then 1 else 0,
+            snapshot.count,
+            cpu_x10,
+            kern_x10,
+            snapshot.memory_used,
+            snapshot.memory_total,
+            snapshot.threads,
+            snapshot.handles,
+            snapshot.memory.commit_kb,
+            snapshot.memory.commit_limit_kb,
+            Model.CommitPeakKb(),
+            snapshot.memory.available_kb,
+            snapshot.memory.cache_kb,
+            snapshot.memory.kernel_paged_kb,
+            snapshot.memory.kernel_nonpaged_kb,
+            snapshot.memory.swap_total_kb,
+            snapshot.memory.swap_free_kb,
+            Model.CurrentProcessId())
+        AppendHistory(*bytes, "cpu", HISTORY_CPU)
+        AppendHistory(*bytes, "kern", HISTORY_KERNEL)
+        AppendHistory(*bytes, "mem", HISTORY_MEMORY)
+
+        direction: s32 = ifx desc then -1 else 1
+        emitted: s32 = 0
+        if grouped {
+            groups := Model.GroupedCurrent()
+            if groups.count > 0 {
+                Model.SortGroupOrder(snapshot, groups, order_scratch[0:groups.count], sort_column, direction)
+                for index: 0..groups.count - 1 {
+                    if emitted >= MAX_ROWS { break }
+                    row := Model.GroupProcess(snapshot, *groups.groups[order_scratch[index]])
+                    name := TextView(row.name[0:row.name_count])
+                    if filter.count > 0 && !ContainsFold(name, filter) { continue }
+                    row_cpu := cast(s64)(row.cpu_percent * 10.0 + 0.5)
+                    BuilderPrint(*bytes, "p\t%\t%\t%\t%\t%\t%\t%\t",
+                        row.pid, row.group_count, row_cpu, row.memory_bytes,
+                        row.ticks, row.threads, Model.StateName(row.state))
+                    SanitizeName(*bytes, name)
+                    BuilderPrint(*bytes, "\n")
+                    emitted += 1
+                }
+            }
+        } else if snapshot.count > 0 {
+            Model.SortOrder(snapshot, order_scratch[0:snapshot.count], sort_column, direction)
+            for index: 0..snapshot.count - 1 {
+                if emitted >= MAX_ROWS { break }
+                row := snapshot.processes[order_scratch[index]]
+                name := TextView(row.name[0:row.name_count])
+                if filter.count > 0 && !ContainsFold(name, filter) { continue }
+                row_cpu := cast(s64)(row.cpu_percent * 10.0 + 0.5)
+                BuilderPrint(*bytes, "p\t%\t%\t%\t%\t%\t%\t%\t",
+                    row.pid, row.group_count, row_cpu, row.memory_bytes,
+                    row.ticks, row.threads, Model.StateName(row.state))
+                SanitizeName(*bytes, name)
+                BuilderPrint(*bytes, "\n")
+                emitted += 1
+            }
+        }
+        return Finish(context, bytes)
+    }
+
+    EndGroupByName :: (context: *Context, name: string) -> string {
+        if name.count == 0 { return ReplyLine(context, "err", "No process group selected") }
+        snapshot := Model.Current()
+        target: Process
+        limit := name.count
+        if limit > NAME_CAPACITY { limit = NAME_CAPACITY }
+        for index: 0..limit - 1 { target.name[index] = name[index] }
+        target.name_count = cast(s32)limit
+        result := Model.EndProcessGroup(snapshot, *target)
+        bytes: Vec(u8)
+        if result.sent > 0 {
+            BuilderPrint(*bytes, "ok\tEnded % process(es)", result.sent)
+            if result.failed > 0 { BuilderPrint(*bytes, " (% failed)", result.failed) }
+            BuilderPrint(*bytes, "\n")
+        } else {
+            BuilderPrint(*bytes, "err\tCould not end process group\n")
+        }
+        return Finish(context, bytes)
+    }
+}
+
+#scope_export
+Call :: (context: *Context, request: string) -> string {
+    #if #defined(PLATFORM_WEB) || #defined(ANDROID_BUILD) {
+        unused request
+        return ReplyLine(context, "unsupported", "System process monitoring is available on desktop Linux.")
+    } else {
+        op_bytes: [32]u8
+        op := Text(request, "op", op_bytes[:])
+        if op == "snapshot" {
+            return SnapshotReply(context, request)
+        }
+        if op == "end_pid" {
+            pid := Number(request, "pid")
+            if pid <= 0 || pid == Model.CurrentProcessId() {
+                return ReplyLine(context, "err", "Cannot end this process")
+            }
+            if Model.EndTask(pid) {
+                return ReplyLine(context, "ok", "Termination signal sent")
+            }
+            return ReplyLine(context, "err", "Could not end process (permission denied or exited)")
+        }
+        if op == "end_group" {
+            name_bytes: [64]u8
+            return EndGroupByName(context, Text(request, "name", name_bytes[:]))
+        }
+        if op == "run" {
+            cmd_bytes: [512]u8
+            command := Text(request, "command", cmd_bytes[:])
+            if command.count == 0 { return ReplyLine(context, "err", "Enter a command to run") }
+            if Model.StartTask(command) {
+                return ReplyLine(context, "ok", "Command started")
+            }
+            return ReplyLine(context, "err", "Could not start command")
+        }
+        return ReplyLine(context, "err", "Unknown operation")
+    }
+}

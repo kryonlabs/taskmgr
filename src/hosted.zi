@@ -1,0 +1,784 @@
+// Hosted portable Task Manager frontend for Werkzeug (KRYON_HOSTED_UI).
+// Communicates with the host's `taskmgr.v1` service backed by taskmgr's Model.
+Box :: #import "kryon/box";
+Button :: #import "kryon/button";
+Scroll :: #import "kryon/scroll";
+Text :: #import "kryon/text";
+TextField :: #import "kryon/text_field";
+#import "kryon/app_context"
+#import "kryon/app_protocol"
+#import "kryon/control_props"
+#import "kryon/drawing_props"
+#import "kryon/geometry"
+#import "kryon/session"
+#import "kryon/text_align"
+#import "kryon/tree"
+#import "std/number_text"
+#import "std/text_buffer"
+#import "std/vec"
+
+// Performance gauge vector shape (MingCute-style 24x24).
+ICON_SHAPE :: "M12 4a9 9 0 0 0-9 9c0 2.75 1.24 5.21 3.18 6.86a1 1 0 0 0 1.3-.06l1.06-1.06a1 1 0 0 0-.06-1.47A6.98 6.98 0 0 1 5 13a7 7 0 1 1 14 0c0 1.66-.58 3.19-1.55 4.38a1 1 0 0 0-.06 1.36l1.06 1.06a1 1 0 0 0 1.38.07A8.96 8.96 0 0 0 21 13a9 9 0 0 0-9-9zm3.54 5.46a1 1 0 0 0-1.42 0l-2.83 2.83a1.5 1.5 0 1 0 1.42 1.42l2.83-2.83a1 1 0 0 0 0-1.42z";
+
+TAB_PROCESSES :: 0;
+TAB_PERFORMANCE :: 1;
+
+COL_NAME :: 0;
+COL_PID :: 1;
+COL_CPU :: 2;
+COL_TIME :: 3;
+COL_MEMORY :: 4;
+
+MAX_ROWS :: 160;
+MAX_HISTORY :: 60;
+
+Row :: struct {
+    pid: s32
+    group_count: s32
+    cpu_x10: s32
+    memory_bytes: u64
+    ticks: u64
+    threads: s32
+    state: [16]u8
+    name: [40]u8
+}
+
+FieldState :: struct {
+    cursor: s32
+    anchor: s32
+    scroll_x: s32
+}
+
+session: Session;
+current_tab: s32 = TAB_PROCESSES;
+sort_col: s32 = COL_CPU;
+sort_desc: bool = true;
+grouped: bool = true;
+refresh_interval: float64 = 1.0;
+last_refresh: float64 = -10.0;
+force_refresh: bool = true;
+need_query: bool = true;
+scroll_y: s32;
+
+unsupported: bool;
+unsupported_reason: [160]u8;
+
+processes_available: bool;
+cpu_available: bool;
+memory_available: bool;
+total_processes: s32;
+cpu_x10: s32;
+kernel_x10: s32;
+mem_used: u64;
+mem_total: u64;
+total_threads: s64;
+total_handles: s64;
+commit_kb: s64;
+commit_limit_kb: s64;
+commit_peak_kb: s64;
+avail_kb: s64;
+cache_kb: s64;
+kpaged_kb: s64;
+knonpaged_kb: s64;
+swap_total_kb: s64;
+swap_free_kb: s64;
+self_pid: s32;
+
+cpu_hist: [MAX_HISTORY]s32;
+cpu_hist_count: s32;
+kern_hist: [MAX_HISTORY]s32;
+kern_hist_count: s32;
+mem_hist: [MAX_HISTORY]s32;
+mem_hist_count: s32;
+
+rows: [MAX_ROWS]Row;
+row_count: s32;
+selected_pid: s32 = -1;
+selected_name: [40]u8;
+selected_group_count: s32;
+
+confirm_end: bool;
+run_dialog: bool;
+status_msg: [128]u8;
+
+filter_text: [96]u8;
+filter_field: FieldState;
+run_text: [256]u8;
+run_field: FieldState;
+focused_field: s32; // 0 none, 1 filter, 2 run
+
+CopyText :: (dst: []u8, src: string) {
+    limit := src.count
+    if limit >= dst.count { limit = dst.count - 1 }
+    for index: 0..limit - 1 { dst[index] = src[index] }
+    dst[limit] = cast(u8)0
+}
+
+AppendStr :: (dst: []u8, used: s32, text: string) -> s32 {
+    pos := used
+    for index: 0..text.count - 1 {
+        if pos >= cast(s32)dst.count - 1 { break }
+        dst[pos] = text[index]
+        pos += 1
+    }
+    dst[pos] = cast(u8)0
+    return pos
+}
+
+AppendInt :: (dst: []u8, used: s32, value: s64) -> s32 {
+    num: [32]u8
+    return AppendStr(dst, used, FormatInteger(value, num[:]))
+}
+
+ParseS64 :: (text: string) -> s64 {
+    if text.count == 0 { return 0 }
+    neg := false
+    index: s64 = 0
+    if text[0] == cast(u8)45 { neg = true; index = 1 }
+    value: s64 = 0
+    while index < text.count {
+        ch := text[index]
+        if ch < cast(u8)48 || ch > cast(u8)57 { break }
+        value = value * 10 + cast(s64)(ch - cast(u8)48)
+        index += 1
+    }
+    return ifx neg then 0 - value else value
+}
+
+ParseU64 :: (text: string) -> u64 {
+    value: u64 = 0
+    for index: 0..text.count - 1 {
+        ch := text[index]
+        if ch < cast(u8)48 || ch > cast(u8)57 { break }
+        value = value * cast(u64)10 + cast(u64)(ch - cast(u8)48)
+    }
+    return value
+}
+
+NextToken :: (line: string, cursor: *s64) -> string {
+    start := cursor.*
+    if start >= line.count { return "" }
+    pos := start
+    while pos < line.count && line[pos] != cast(u8)9 { pos += 1 }
+    cursor.* = ifx pos < line.count then pos + 1 else pos
+    return line[start:pos]
+}
+
+WriteQuoted :: (bytes: *Vec(u8), text: string) {
+    BuilderPrint(bytes, "\"")
+    for byte: text {
+        if byte == cast(u8)34 || byte == cast(u8)92 { BuilderPrint(bytes, "\\") }
+        if byte >= cast(u8)32 { unused VecPush(bytes.*, byte) }
+    }
+    BuilderPrint(bytes, "\"")
+}
+
+FormatTenths :: (tenths: s32, out: []u8) -> string {
+    whole := tenths / 10
+    frac := tenths % 10
+    if frac < 0 { frac = 0 - frac }
+    used := AppendInt(out, 0, cast(s64)whole)
+    used = AppendStr(out, used, ".")
+    used = AppendInt(out, used, cast(s64)frac)
+    used = AppendStr(out, used, "%")
+    return TextView(out[:used])
+}
+
+FormatBytesShort :: (bytes: u64, out: []u8) -> string {
+    if bytes >= cast(u64)1073741824 {
+        tenths := (bytes * cast(u64)10) / cast(u64)1073741824
+        used := AppendInt(out, 0, cast(s64)(tenths / cast(u64)10))
+        used = AppendStr(out, used, ".")
+        used = AppendInt(out, used, cast(s64)(tenths % cast(u64)10))
+        used = AppendStr(out, used, " GiB")
+        return TextView(out[:used])
+    }
+    if bytes >= cast(u64)1048576 {
+        tenths := (bytes * cast(u64)10) / cast(u64)1048576
+        used := AppendInt(out, 0, cast(s64)(tenths / cast(u64)10))
+        used = AppendStr(out, used, ".")
+        used = AppendInt(out, used, cast(s64)(tenths % cast(u64)10))
+        used = AppendStr(out, used, " MiB")
+        return TextView(out[:used])
+    }
+    kb := bytes / cast(u64)1024
+    used := AppendInt(out, 0, cast(s64)kb)
+    used = AppendStr(out, used, " KiB")
+    return TextView(out[:used])
+}
+
+ParseHistoryLine :: (line: string, target: []s32) -> s32 {
+    cursor: s64 = 0
+    unused NextToken(line, *cursor)
+    count: s32 = 0
+    while cursor < line.count && count < cast(s32)target.count {
+        tok := NextToken(line, *cursor)
+        if tok.count == 0 { break }
+        target[count] = cast(s32)ParseS64(tok)
+        count += 1
+    }
+    return count
+}
+
+ParseSnapshot :: (reply: string) {
+    row_count = 0
+    unsupported = false
+    pos: s64 = 0
+    while pos < reply.count {
+        end := pos
+        while end < reply.count && reply[end] != cast(u8)10 { end += 1 }
+        line := reply[pos:end]
+        pos = ifx end < reply.count then end + 1 else end
+        if line.count == 0 { continue }
+        cursor: s64 = 0
+        tag := NextToken(line, *cursor)
+        if tag == "unsupported" {
+            unsupported = true
+            CopyText(unsupported_reason[:], NextToken(line, *cursor))
+            return
+        }
+        if tag == "ok" {
+            processes_available = ParseS64(NextToken(line, *cursor)) != 0
+            cpu_available = ParseS64(NextToken(line, *cursor)) != 0
+            memory_available = ParseS64(NextToken(line, *cursor)) != 0
+            total_processes = cast(s32)ParseS64(NextToken(line, *cursor))
+            cpu_x10 = cast(s32)ParseS64(NextToken(line, *cursor))
+            kernel_x10 = cast(s32)ParseS64(NextToken(line, *cursor))
+            mem_used = ParseU64(NextToken(line, *cursor))
+            mem_total = ParseU64(NextToken(line, *cursor))
+            total_threads = ParseS64(NextToken(line, *cursor))
+            total_handles = ParseS64(NextToken(line, *cursor))
+            commit_kb = ParseS64(NextToken(line, *cursor))
+            commit_limit_kb = ParseS64(NextToken(line, *cursor))
+            commit_peak_kb = ParseS64(NextToken(line, *cursor))
+            avail_kb = ParseS64(NextToken(line, *cursor))
+            cache_kb = ParseS64(NextToken(line, *cursor))
+            kpaged_kb = ParseS64(NextToken(line, *cursor))
+            knonpaged_kb = ParseS64(NextToken(line, *cursor))
+            swap_total_kb = ParseS64(NextToken(line, *cursor))
+            swap_free_kb = ParseS64(NextToken(line, *cursor))
+            self_pid = cast(s32)ParseS64(NextToken(line, *cursor))
+            continue
+        }
+        if tag == "cpu" { cpu_hist_count = ParseHistoryLine(line, cpu_hist[:]); continue }
+        if tag == "kern" { kern_hist_count = ParseHistoryLine(line, kern_hist[:]); continue }
+        if tag == "mem" { mem_hist_count = ParseHistoryLine(line, mem_hist[:]); continue }
+        if tag == "p" && row_count < MAX_ROWS {
+            item := *rows[row_count]
+            item.* = Row.{}
+            item.pid = cast(s32)ParseS64(NextToken(line, *cursor))
+            item.group_count = cast(s32)ParseS64(NextToken(line, *cursor))
+            item.cpu_x10 = cast(s32)ParseS64(NextToken(line, *cursor))
+            item.memory_bytes = ParseU64(NextToken(line, *cursor))
+            item.ticks = ParseU64(NextToken(line, *cursor))
+            item.threads = cast(s32)ParseS64(NextToken(line, *cursor))
+            CopyText(item.state[:], NextToken(line, *cursor))
+            CopyText(item.name[:], NextToken(line, *cursor))
+            row_count += 1
+        }
+    }
+    // Keep selection coherent with updated rows.
+    if selected_pid >= 0 {
+        found := false
+        for index: 0..row_count - 1 {
+            if rows[index].pid == selected_pid {
+                CopyText(selected_name[:], TextUntilNul(rows[index].name[:]))
+                selected_group_count = rows[index].group_count
+                found = true
+                break
+            }
+        }
+        if !found {
+            selected_pid = -1
+            selected_name[0] = cast(u8)0
+            selected_group_count = 0
+            confirm_end = false
+        }
+    }
+}
+
+QuerySnapshot :: (refresh: bool) {
+    bytes: Vec(u8)
+    BuilderPrint(*bytes, "{\"op\":\"snapshot\",\"sort\":%,\"desc\":%,\"grouped\":%,\"refresh\":%,\"filter\":",
+        sort_col, ifx sort_desc then 1 else 0, ifx grouped then 1 else 0, ifx refresh then 1 else 0)
+    WriteQuoted(*bytes, TextUntilNul(filter_text[:]))
+    BuilderPrint(*bytes, "}")
+    reply: string
+    {
+        request := TextView(VecSlice(bytes, 0, bytes.count))
+        reply = AppService("taskmgr.v1", request)
+    }
+    VecFree(bytes)
+    ParseSnapshot(reply)
+}
+
+SendEndSelected :: () {
+    if selected_pid < 0 { return }
+    bytes: Vec(u8)
+    if grouped && selected_group_count > 1 {
+        BuilderPrint(*bytes, "{\"op\":\"end_group\",\"name\":")
+        WriteQuoted(*bytes, TextUntilNul(selected_name[:]))
+        BuilderPrint(*bytes, "}")
+    } else {
+        BuilderPrint(*bytes, "{\"op\":\"end_pid\",\"pid\":%}", selected_pid)
+    }
+    reply: string
+    {
+        reply = AppService("taskmgr.v1", TextView(VecSlice(bytes, 0, bytes.count)))
+    }
+    VecFree(bytes)
+    cursor: s64 = 0
+    unused NextToken(reply, *cursor)
+    msg := NextToken(reply, *cursor)
+    // Trim trailing newline.
+    if msg.count > 0 && msg[msg.count - 1] == cast(u8)10 { msg = msg[:msg.count - 1] }
+    CopyText(status_msg[:], msg)
+    confirm_end = false
+    force_refresh = true
+}
+
+SendRunCommand :: () {
+    bytes: Vec(u8)
+    {
+        cmd := TextUntilNul(run_text[:])
+        if cmd.count == 0 {
+            CopyText(status_msg[:], "Enter a command to run")
+            return
+        }
+        BuilderPrint(*bytes, "{\"op\":\"run\",\"command\":")
+        WriteQuoted(*bytes, cmd)
+        BuilderPrint(*bytes, "}")
+    }
+    reply: string
+    {
+        reply = AppService("taskmgr.v1", TextView(VecSlice(bytes, 0, bytes.count)))
+    }
+    VecFree(bytes)
+    cursor: s64 = 0
+    unused NextToken(reply, *cursor)
+    msg := NextToken(reply, *cursor)
+    if msg.count > 0 && msg[msg.count - 1] == cast(u8)10 { msg = msg[:msg.count - 1] }
+    CopyText(status_msg[:], msg)
+    run_text[0] = cast(u8)0
+    run_field = FieldState.{}
+    run_dialog = false
+    focused_field = 0
+    force_refresh = true
+}
+
+ApplyEdit :: (buffer: []u8, edit: TextField.Edit) -> bool {
+    if !edit.changed { return false }
+    length := cast(s32)TextUntilNul(buffer).count
+    if edit.start < 0 || edit.end < edit.start || edit.end > length { return false }
+    used := length - (edit.end - edit.start) + cast(s32)edit.replacement.count
+    if used >= cast(s32)buffer.count || used >= 512 { return false }
+    next: [512]u8
+    pos: s32 = 0
+    for i: 0..edit.start - 1 { next[pos] = buffer[i]; pos += 1 }
+    for i: 0..cast(s32)edit.replacement.count - 1 { next[pos] = edit.replacement[i]; pos += 1 }
+    for i: edit.end..length - 1 { next[pos] = buffer[i]; pos += 1 }
+    for i: 0..cast(s32)buffer.count - 1 {
+        buffer[i] = ifx i < used then next[i] else cast(u8)0
+    }
+    return true
+}
+
+DrawField :: (id: s32, label: string, buffer: []u8, state: *FieldState, bounds: Rectangle) -> bool {
+    snapshot: [512]u8
+    CopyText(snapshot[:], TextUntilNul(buffer))
+    props: TextField.Props
+    props.key = cast(u64)(600 + id)
+    props.focus_id = 600 + id
+    props.bounds = bounds
+    props.label = label
+    props.value = TextUntilNul(snapshot[:])
+    props.cursor = state.cursor
+    props.anchor = state.anchor
+    props.scroll_x = state.scroll_x
+    props.focused = focused_field == id
+    props.max_bytes = cast(s32)buffer.count - 1
+    props.max_codepoints = props.max_bytes
+    if props.focused { props.input = AppFieldInput() }
+    result := TextField.Draw(session, props)
+    state.cursor = result.cursor
+    state.anchor = result.anchor
+    state.scroll_x = result.scroll_x
+    changed := ApplyEdit(buffer, result.edit)
+    if result.focused { focused_field = id }
+    if result.escaped && focused_field == id { focused_field = 0 }
+    return changed
+}
+
+Action :: (id: s32, label: string, bounds: Rectangle, accent: bool, disabled: bool) -> bool {
+    props: Button.Props
+    props.key = cast(u64)id
+    props.id = id
+    props.bounds = bounds
+    props.label = label
+    props.disabled = disabled
+    props.size = ControlSize.ControlSizeSmall
+    props.tone = ifx accent then ButtonTone.ButtonToneAccent else ButtonTone.ButtonToneNeutral
+    props.emphasis = ifx accent then ButtonEmphasis.ButtonEmphasisFilled else ButtonEmphasis.ButtonEmphasisSoft
+    return Button.Draw(session, props) != 0
+}
+
+DangerAction :: (id: s32, label: string, bounds: Rectangle, disabled: bool) -> bool {
+    props: Button.Props
+    props.key = cast(u64)id
+    props.id = id
+    props.bounds = bounds
+    props.label = label
+    props.disabled = disabled
+    props.size = ControlSize.ControlSizeSmall
+    props.tone = ButtonTone.ButtonToneDanger
+    props.emphasis = ButtonEmphasis.ButtonEmphasisFilled
+    return Button.Draw(session, props) != 0
+}
+
+DrawText :: (key: u64, value: string, bounds: Rectangle, size: s32, align: TextAlign) {
+    Text.Draw(session, Text.Props.{.key = key, .bounds = bounds, .text = value, .size = size,
+            .align = align, .wrap = Text.Wrap.TextWrapEllipsis})
+}
+
+DrawGraph :: (base_key: u64, title: string, value_text: string, samples: []s32, count: s32,
+    bounds: Rectangle, bar_color: Color, secondary: []s32, secondary_count: s32) {
+    dark := AppDark()
+    bg := ifx dark then Color.{33, 36, 43, 255} else Color.{242, 245, 250, 255}
+    border := ifx dark then Color.{66, 71, 87, 255} else Color.{209, 217, 230, 255}
+    track := ifx dark then Color.{46, 51, 61, 255} else Color.{227, 232, 242, 255}
+    Box.Draw(session, Box.Props.{.key = base_key, .bounds = bounds, .fill = bg, .border = border, .radius = 8.0})
+    DrawText(base_key + 1, title, Rectangle.{bounds.x + 10.0, bounds.y + 6.0, bounds.width * 0.6, 20.0}, 14, TextAlign.TextAlignStart)
+    DrawText(base_key + 2, value_text, Rectangle.{bounds.x + bounds.width * 0.55, bounds.y + 6.0, bounds.width * 0.45 - 10.0, 20.0}, 14, TextAlign.TextAlignEnd)
+
+    plot := Rectangle.{bounds.x + 10.0, bounds.y + 30.0, bounds.width - 20.0, bounds.height - 40.0}
+    if plot.height < 24.0 || plot.width < 40.0 { return }
+    Box.Draw(session, Box.Props.{.key = base_key + 3, .bounds = plot, .fill = track, .radius = 4.0})
+    if count <= 0 { return }
+    slot_w := plot.width / cast(float32)MAX_HISTORY
+    offset := MAX_HISTORY - count
+    for i: 0..count - 1 {
+        pct := cast(float32)samples[i] / 1000.0
+        if pct < 0.0 { pct = 0.0 }
+        if pct > 1.0 { pct = 1.0 }
+        h := plot.height * pct
+        if h < 1.5 && samples[i] > 0 { h = 1.5 }
+        x := plot.x + cast(float32)(offset + i) * slot_w
+        w := ifx slot_w > 1.5 then slot_w - 0.5 else slot_w
+        if h > 0.0 {
+            Box.Draw(session, Box.Props.{.key = base_key + 10 + cast(u64)i,
+                    .bounds = Rectangle.{x, plot.y + plot.height - h, w, h}, .fill = bar_color})
+        }
+        if i < secondary_count && secondary[i] > 0 {
+            spct := cast(float32)secondary[i] / 1000.0
+            if spct > 1.0 { spct = 1.0 }
+            sh := plot.height * spct
+            if sh > 0.0 {
+                Box.Draw(session, Box.Props.{.key = base_key + 90 + cast(u64)i,
+                        .bounds = Rectangle.{x, plot.y + plot.height - sh, w, sh},
+                        .fill = Color.{217, 77, 71, 216}})
+            }
+        }
+    }
+}
+
+ToggleSort :: (column: s32) {
+    if sort_col == column {
+        sort_desc = !sort_desc
+    } else {
+        sort_col = column
+        sort_desc = column != COL_NAME
+    }
+    need_query = true
+}
+
+DrawProcesses :: (area: Rectangle) {
+    // Filter + Controls row.
+    top_y := area.y
+    filter_w := area.width - 172.0
+    if filter_w < 100.0 { filter_w = area.width }
+    if DrawField(1, "Filter processes...", filter_text[:], *filter_field,
+        Rectangle.{area.x, top_y, filter_w, 36.0}) {
+        scroll_y = 0
+        need_query = true
+    }
+    if filter_w < area.width {
+        if Action(20, ifx grouped then "Grouped" else "All PIDs",
+            Rectangle.{area.x + filter_w + 6.0, top_y, 82.0, 36.0}, grouped, false) {
+            grouped = !grouped
+            scroll_y = 0
+            need_query = true
+        }
+        if Action(21, "Refresh",
+            Rectangle.{area.x + filter_w + 94.0, top_y, 78.0, 36.0}, false, false) {
+            force_refresh = true
+        }
+    }
+
+    // Sort header row.
+    header_y := top_y + 42.0
+    col_name_w := area.width * 0.44
+    col_pid_w := area.width * 0.16
+    col_cpu_w := area.width * 0.16
+    col_mem_w := area.width - col_name_w - col_pid_w - col_cpu_w - 12.0
+    if Action(30, ifx sort_col == COL_NAME then (ifx sort_desc then "Name v" else "Name ^") else "Name",
+        Rectangle.{area.x, header_y, col_name_w, 28.0}, sort_col == COL_NAME, false) {
+        ToggleSort(COL_NAME)
+    }
+    if Action(31, ifx sort_col == COL_PID then (ifx sort_desc then "PID v" else "PID ^") else "PID",
+        Rectangle.{area.x + col_name_w + 4.0, header_y, col_pid_w, 28.0}, sort_col == COL_PID, false) {
+        ToggleSort(COL_PID)
+    }
+    if Action(32, ifx sort_col == COL_CPU then (ifx sort_desc then "CPU v" else "CPU ^") else "CPU",
+        Rectangle.{area.x + col_name_w + col_pid_w + 8.0, header_y, col_cpu_w, 28.0}, sort_col == COL_CPU, false) {
+        ToggleSort(COL_CPU)
+    }
+    if Action(33, ifx sort_col == COL_MEMORY then (ifx sort_desc then "Mem v" else "Mem ^") else "Mem",
+        Rectangle.{area.x + col_name_w + col_pid_w + col_cpu_w + 12.0, header_y, col_mem_w, 28.0}, sort_col == COL_MEMORY, false) {
+        ToggleSort(COL_MEMORY)
+    }
+
+    // Bottom action bar height.
+    footer_h: float32 = ifx confirm_end || run_dialog then 86.0 else 44.0
+    list_y := header_y + 34.0
+    list_h := area.y + area.height - list_y - footer_h - 6.0
+    if list_h < 60.0 { list_h = 60.0 }
+    list_bounds := Rectangle.{area.x, list_y, area.width, list_h}
+
+    row_h: float32 = 34.0
+    content_h := cast(s32)(cast(float32)row_count * row_h) + 8
+    if content_h < cast(s32)list_h { content_h = cast(s32)list_h }
+    scroll := Scroll.Draw(session, Scroll.Props.{.key = 700, .bounds = list_bounds,
+            .scroll_offset = scroll_y, .content_height = content_h, .scale = 1.0})
+    scroll_y = scroll.scroll_offset
+
+    if scroll.opened {
+        dark := AppDark()
+        alt_bg := ifx dark then Color.{38, 41, 48, 255} else Color.{245, 247, 252, 255}
+        sel_bg := ifx dark then Color.{46, 77, 122, 255} else Color.{214, 230, 250, 255}
+        cw := scroll.content.width - 10.0
+        for i: 0..row_count - 1 {
+            y := scroll.content.y + cast(float32)i * row_h
+            item := rows[i]
+            is_sel := item.pid == selected_pid
+            if is_sel || (i % 2 == 1) {
+                Box.Draw(session, Box.Props.{.key = cast(u64)(2000 + i * 8),
+                        .bounds = Rectangle.{scroll.content.x, y, cw, row_h - 2.0},
+                        .fill = ifx is_sel then sel_bg else alt_bg, .radius = 4.0})
+            }
+            name_buf: [56]u8
+            used := AppendStr(name_buf[:], 0, TextUntilNul(item.name[:]))
+            if grouped && item.group_count > 1 {
+                used = AppendStr(name_buf[:], used, " (")
+                used = AppendInt(name_buf[:], used, cast(s64)item.group_count)
+                used = AppendStr(name_buf[:], used, ")")
+            }
+            if Action(3000 + cast(s32)i, TextView(name_buf[:used]),
+                Rectangle.{scroll.content.x + 2.0, y + 2.0, col_name_w - 4.0, row_h - 6.0}, is_sel, false) {
+                selected_pid = item.pid
+                CopyText(selected_name[:], TextUntilNul(item.name[:]))
+                selected_group_count = item.group_count
+                confirm_end = false
+            }
+            pid_buf: [16]u8
+            cpu_buf: [16]u8
+            mem_buf: [20]u8
+            DrawText(cast(u64)(2000 + i * 8 + 1), FormatInteger(cast(s64)item.pid, pid_buf[:]),
+                Rectangle.{scroll.content.x + col_name_w + 4.0, y + 7.0, col_pid_w, 20.0}, 13, TextAlign.TextAlignEnd)
+            DrawText(cast(u64)(2000 + i * 8 + 2), FormatTenths(item.cpu_x10, cpu_buf[:]),
+                Rectangle.{scroll.content.x + col_name_w + col_pid_w + 8.0, y + 7.0, col_cpu_w, 20.0}, 13, TextAlign.TextAlignEnd)
+            DrawText(cast(u64)(2000 + i * 8 + 3), FormatBytesShort(item.memory_bytes, mem_buf[:]),
+                Rectangle.{scroll.content.x + col_name_w + col_pid_w + col_cpu_w + 12.0, y + 7.0, col_mem_w - 14.0, 20.0}, 13, TextAlign.TextAlignEnd)
+        }
+        End(session)
+    }
+
+    // Footer actions / confirmation / run bar.
+    foot_y := list_y + list_h + 6.0
+    if confirm_end && selected_pid >= 0 {
+        prompt_buf: [96]u8
+        used := AppendStr(prompt_buf[:], 0, "End ")
+        used = AppendStr(prompt_buf[:], used, TextUntilNul(selected_name[:]))
+        if grouped && selected_group_count > 1 {
+            used = AppendStr(prompt_buf[:], used, " group?")
+        } else {
+            used = AppendStr(prompt_buf[:], used, " (PID ")
+            used = AppendInt(prompt_buf[:], used, cast(s64)selected_pid)
+            used = AppendStr(prompt_buf[:], used, ")?")
+        }
+        DrawText(810, TextView(prompt_buf[:used]), Rectangle.{area.x, foot_y, area.width, 24.0}, 14, TextAlign.TextAlignStart)
+        if DangerAction(42, "Confirm End", Rectangle.{area.x, foot_y + 30.0, 130.0, 36.0}, false) {
+            SendEndSelected()
+        }
+        if Action(43, "Cancel", Rectangle.{area.x + 138.0, foot_y + 30.0, 96.0, 36.0}, false, false) {
+            confirm_end = false
+        }
+    } else if run_dialog {
+        unused DrawField(2, "Command to run...", run_text[:], *run_field,
+            Rectangle.{area.x, foot_y, area.width, 36.0})
+        if Action(44, "Start", Rectangle.{area.x, foot_y + 42.0, 96.0, 34.0}, true, false) {
+            SendRunCommand()
+        }
+        if Action(45, "Cancel", Rectangle.{area.x + 104.0, foot_y + 42.0, 96.0, 34.0}, false, false) {
+            run_dialog = false
+            focused_field = 0
+        }
+    } else {
+        can_end := selected_pid > 0 && selected_pid != self_pid
+        if DangerAction(40, ifx grouped && selected_group_count > 1 then "End Group" else "End Task",
+            Rectangle.{area.x, foot_y, 118.0, 36.0}, !can_end) {
+            confirm_end = true
+        }
+        if Action(41, "New Task", Rectangle.{area.x + 126.0, foot_y, 102.0, 36.0}, false, false) {
+            run_dialog = true
+            focused_field = 2
+        }
+        msg := TextUntilNul(status_msg[:])
+        if msg.count > 0 {
+            DrawText(811, msg, Rectangle.{area.x + 236.0, foot_y + 8.0, area.width - 236.0, 22.0}, 12, TextAlign.TextAlignEnd)
+        }
+    }
+}
+
+DrawStatCard :: (base_key: u64, title: string, lines: []string, bounds: Rectangle) {
+    dark := AppDark()
+    bg := ifx dark then Color.{33, 36, 43, 255} else Color.{242, 245, 250, 255}
+    border := ifx dark then Color.{66, 71, 87, 255} else Color.{209, 217, 230, 255}
+    Box.Draw(session, Box.Props.{.key = base_key, .bounds = bounds, .fill = bg, .border = border, .radius = 8.0})
+    DrawText(base_key + 1, title, Rectangle.{bounds.x + 10.0, bounds.y + 8.0, bounds.width - 20.0, 20.0}, 14, TextAlign.TextAlignStart)
+    for i: 0..lines.count - 1 {
+        DrawText(base_key + 2 + cast(u64)i, lines[i],
+            Rectangle.{bounds.x + 10.0, bounds.y + 32.0 + cast(float32)i * 20.0, bounds.width - 20.0, 18.0}, 13, TextAlign.TextAlignStart)
+    }
+}
+
+DrawPerformance :: (area: Rectangle) {
+    // Update speed selector row.
+    speed_w := (area.width - 18.0) / 4.0
+    if Action(50, "High", Rectangle.{area.x, area.y, speed_w, 30.0}, refresh_interval == 0.5, false) { refresh_interval = 0.5 }
+    if Action(51, "Normal", Rectangle.{area.x + speed_w + 6.0, area.y, speed_w, 30.0}, refresh_interval == 1.0, false) { refresh_interval = 1.0 }
+    if Action(52, "Low", Rectangle.{area.x + (speed_w + 6.0) * 2.0, area.y, speed_w, 30.0}, refresh_interval == 4.0, false) { refresh_interval = 4.0 }
+    if Action(53, "Paused", Rectangle.{area.x + (speed_w + 6.0) * 3.0, area.y, speed_w, 30.0}, refresh_interval == 0.0, false) { refresh_interval = 0.0 }
+
+    graph_y := area.y + 38.0
+    graph_h: float32 = 126.0
+    cpu_val: [24]u8
+    mem_val: [48]u8
+    mem_u: [20]u8
+    mem_t: [20]u8
+    used_m := AppendStr(mem_val[:], 0, FormatBytesShort(mem_used, mem_u[:]))
+    used_m = AppendStr(mem_val[:], used_m, " / ")
+    used_m = AppendStr(mem_val[:], used_m, FormatBytesShort(mem_total, mem_t[:]))
+
+    DrawGraph(900, "CPU Usage", FormatTenths(cpu_x10, cpu_val[:]), cpu_hist[:], cpu_hist_count,
+        Rectangle.{area.x, graph_y, area.width, graph_h}, Color.{51, 148, 230, 230},
+        kern_hist[:], kern_hist_count)
+
+    DrawGraph(1100, "Memory Usage", TextView(mem_val[:used_m]), mem_hist[:], mem_hist_count,
+        Rectangle.{area.x, graph_y + graph_h + 10.0, area.width, graph_h}, Color.{56, 173, 115, 230},
+        mem_hist[:0], 0)
+
+    cards_y := graph_y + (graph_h + 10.0) * 2.0
+    card_w := (area.width - 10.0) * 0.5
+    card_h: float32 = 122.0
+
+    l1: [48]u8; l2: [48]u8; l3: [48]u8; l4: [48]u8
+    u1 := AppendStr(l1[:], 0, "Processes: "); u1 = AppendInt(l1[:], u1, cast(s64)total_processes)
+    u2 := AppendStr(l2[:], 0, "Threads: "); u2 = AppendInt(l2[:], u2, total_threads)
+    u3 := AppendStr(l3[:], 0, "Handles: ")
+    if total_handles >= 0 { u3 = AppendInt(l3[:], u3, total_handles) } else { u3 = AppendStr(l3[:], u3, "n/a") }
+    kbuf: [16]u8
+    u4 := AppendStr(l4[:], 0, "Kernel CPU: "); u4 = AppendStr(l4[:], u4, FormatTenths(kernel_x10, kbuf[:]))
+    sys_lines: [4]string = .[TextView(l1[:u1]), TextView(l2[:u2]), TextView(l3[:u3]), TextView(l4[:u4])]
+    DrawStatCard(1300, "System", sys_lines[:], Rectangle.{area.x, cards_y, card_w, card_h})
+
+    m1: [48]u8; m2: [48]u8; m3: [48]u8; m4: [48]u8
+    b1: [20]u8; b2: [20]u8; b3: [20]u8; b4: [20]u8
+    mu1 := AppendStr(m1[:], 0, "Available: "); mu1 = AppendStr(m1[:], mu1, FormatBytesShort(cast(u64)avail_kb * 1024, b1[:]))
+    mu2 := AppendStr(m2[:], 0, "Cached: "); mu2 = AppendStr(m2[:], mu2, FormatBytesShort(cast(u64)cache_kb * 1024, b2[:]))
+    mu3 := AppendStr(m3[:], 0, "Commit: "); mu3 = AppendStr(m3[:], mu3, FormatBytesShort(cast(u64)commit_kb * 1024, b3[:]))
+    swap_used := ifx swap_total_kb > swap_free_kb then swap_total_kb - swap_free_kb else 0
+    mu4 := AppendStr(m4[:], 0, "Swap: "); mu4 = AppendStr(m4[:], mu4, FormatBytesShort(cast(u64)swap_used * 1024, b4[:]))
+    mem_lines: [4]string = .[TextView(m1[:mu1]), TextView(m2[:mu2]), TextView(m3[:mu3]), TextView(m4[:mu4])]
+    DrawStatCard(1320, "Memory", mem_lines[:], Rectangle.{area.x + card_w + 10.0, cards_y, card_w, card_h})
+}
+
+DrawStatusBar :: (bounds: Rectangle) {
+    dark := AppDark()
+    bg := ifx dark then Color.{31, 33, 41, 255} else Color.{237, 240, 245, 255}
+    Box.Draw(session, Box.Props.{.key = 1400, .bounds = bounds, .fill = bg, .radius = 4.0})
+    buf: [128]u8
+    cpu_b: [16]u8
+    mu_b: [20]u8
+    mt_b: [20]u8
+    used := AppendStr(buf[:], 0, "Processes: ")
+    used = AppendInt(buf[:], used, cast(s64)total_processes)
+    used = AppendStr(buf[:], used, "  |  CPU: ")
+    used = AppendStr(buf[:], used, FormatTenths(cpu_x10, cpu_b[:]))
+    used = AppendStr(buf[:], used, "  |  Mem: ")
+    used = AppendStr(buf[:], used, FormatBytesShort(mem_used, mu_b[:]))
+    used = AppendStr(buf[:], used, " / ")
+    used = AppendStr(buf[:], used, FormatBytesShort(mem_total, mt_b[:]))
+    DrawText(1401, TextView(buf[:used]),
+        Rectangle.{bounds.x + 8.0, bounds.y + 4.0, bounds.width - 16.0, bounds.height - 6.0}, 12, TextAlign.TextAlignStart)
+}
+
+Draw :: () {
+    session = AppSession()
+    bounds := AppBounds()
+    if !AppSupports("taskmgr.v1") {
+        DrawText(1, "Update Werkzeug to open Task Manager.",
+            Rectangle.{bounds.x + 16.0, bounds.y + 24.0, bounds.width - 32.0, 28.0}, 16, TextAlign.TextAlignStart)
+        return
+    }
+    now := AppNow()
+    due := refresh_interval > 0.0 && (now - last_refresh >= refresh_interval || now < last_refresh)
+    if force_refresh || due {
+        QuerySnapshot(true)
+        last_refresh = now
+        force_refresh = false
+        need_query = false
+    } else if need_query {
+        QuerySnapshot(false)
+        need_query = false
+    }
+    if unsupported {
+        DrawText(2, TextUntilNul(unsupported_reason[:]),
+            Rectangle.{bounds.x + 16.0, bounds.y + 24.0, bounds.width - 32.0, 48.0}, 15, TextAlign.TextAlignStart)
+        return
+    }
+
+    pad: float32 = 12.0
+    area := Rectangle.{bounds.x + pad, bounds.y + 8.0, bounds.width - pad * 2.0, bounds.height - 16.0}
+    tab_w := (area.width - 8.0) * 0.5
+    if Action(10, "Processes", Rectangle.{area.x, area.y, tab_w, 34.0}, current_tab == TAB_PROCESSES, false) {
+        current_tab = TAB_PROCESSES
+    }
+    if Action(11, "Performance", Rectangle.{area.x + tab_w + 8.0, area.y, tab_w, 34.0}, current_tab == TAB_PERFORMANCE, false) {
+        current_tab = TAB_PERFORMANCE
+    }
+
+    status_h: float32 = 26.0
+    body := Rectangle.{area.x, area.y + 42.0, area.width, area.height - 42.0 - status_h - 6.0}
+    if current_tab == TAB_PROCESSES {
+        DrawProcesses(body)
+    } else {
+        DrawPerformance(body)
+    }
+    DrawStatusBar(Rectangle.{area.x, area.y + area.height - status_h, area.width, status_h})
+    AppKeyboard(focused_field != 0)
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    mode := AppMode()
+    if mode == APP_IDENTIFY {
+        AppIdentity("taskmgr", 1)
+        AppDescribe("Task Manager", ICON_SHAPE)
+        return APP_PROTOCOL
+    }
+    if mode == APP_FRAME {
+        Draw()
+    }
+    return 0
+}

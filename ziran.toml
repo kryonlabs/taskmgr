@@ -19,6 +19,7 @@ ref = "e8abb23a4bbae6d92b62d477f816d0fa5ded5e1a"
 
 [exports]
 model = "src/model.zi"
+service = "src/service.zi"
 
 [install]
 bin = "taskmgr"
