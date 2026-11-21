@@ -6,16 +6,16 @@ bridge_modules = ["app"]
 tool = "kryon"
 
 [toolchain]
-git = "https://github.com/ziranlang/ziran.git"
-ref = "master"
+git = "https://git.waozi.xyz/ziranlang/ziran.git"
+ref = "5462fe2ebf2c3c42663249e47ef99d61f45ff39f"
 
 [dependencies.kryon]
-git = "https://github.com/kryonlabs/kryon.git"
-ref = "master"
+git = "https://git.waozi.xyz/kryonlabs/kryon.git"
+ref = "788f0151f72da196977c57a4b938e027c139a730"
 
 [dependencies.data_views]
-git = "https://github.com/kryonlabs/data-views.git"
-ref = "master"
+git = "https://git.waozi.xyz/kryonlabs/data-views.git"
+ref = "e8abb23a4bbae6d92b62d477f816d0fa5ded5e1a"
 
 [exports]
 model = "src/model.zi"

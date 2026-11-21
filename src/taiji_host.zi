@@ -1,0 +1,15 @@
+// Taiji provides the same Kryon software surface used by its other ZX apps.
+Surface :: #import "kryon/host/surface";
+App :: #import "app";
+#import "kryon/session"
+#import "kryon/tree"
+
+Draw :: (frame: Surface.Frame) {
+    session: Session = .{frame.slot, frame.epoch}
+    unused App.Frame(session, TreeRootBounds(session))
+}
+
+#program_export
+main :: () -> s32 {
+    return Surface.Run(.{.title = "Task Manager", .width = 400, .height = 480}, Draw, 250)
+}

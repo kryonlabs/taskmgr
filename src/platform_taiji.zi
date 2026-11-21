@@ -1,0 +1,48 @@
+// Only typed guest capabilities: no host filesystem or Linux process calls.
+using Types :: #import "model_types";
+Tasks :: #import "taijios_tasks";
+#program_export
+Sample :: (target: *Snapshot) {
+    target.count = 0
+    target.processes_available = false
+    target.cpu_available = false
+    target.memory_available = false
+    target.memory_used = 0
+    target.memory_total = 0
+    target.handles = -1
+    target.threads = -1
+    count := Tasks.Capture()
+    if count < 0 || count > MAX_PROCESSES { return }
+    target.processes_available = true
+    fields: [4]s64
+    name: [64]u8
+    user: [64]u8
+    for index: 0..count - 1 {
+        if Tasks.TaskAt(index, fields[:], name[:], user[:]) != 0 {
+            target.count = 0
+            target.processes_available = false
+            return
+        }
+        entry: Process
+        if fields[0] <= 0 || fields[0] > 2147483647 { continue }
+        entry.pid = cast(s32)fields[0]
+        entry.group_count = 1
+        entry.state = STATE_SLEEPING
+        if fields[2] == 4 { entry.state = STATE_RUNNING }
+        if fields[2] == 7 { entry.state = STATE_STOPPED }
+        for byte: name {
+            if byte == 0 || entry.name_count >= NAME_CAPACITY { break }
+            entry.name[entry.name_count] = byte
+            entry.name_count += 1
+        }
+        entry.memory_available = fields[3] >= 0 && fields[3] <= 18014398509481983
+        if entry.memory_available { entry.memory_bytes = cast(u64)fields[3] * 1024 }
+        target.processes[target.count] = entry
+        target.count += 1
+    }
+    if Tasks.PoolAt(0, fields[:]) == 0 && fields[0] >= 0 && fields[1] >= 0 {
+        target.memory_available = true
+        target.memory_used = cast(u64)fields[0]
+        target.memory_total = cast(u64)fields[1]
+    }
+}

@@ -1,0 +1,12 @@
+#scope_export
+// Native Linux bindings; never imported by a Taiji bundle.
+libc :: #system_library "libc";
+SysConfRaw :: (name: s32) -> s64 #foreign libc "sysconf";
+SendSignalRaw :: (pid: s32, signal: s32) -> s32 #foreign libc "kill";
+ProcessIdRaw :: () -> s32 #foreign libc "getpid";
+RunShellRaw :: (command: *u8) -> s32 #foreign libc "system";
+
+SysConf :: (name: s32) -> s64 { return SysConfRaw(name) }
+SendSignal :: (pid: s32, signal: s32) -> s32 { return SendSignalRaw(pid, signal) }
+ProcessId :: () -> s32 { return ProcessIdRaw() }
+RunShell :: (command: *u8) -> s32 { return RunShellRaw(command) }

@@ -19,7 +19,7 @@
 // "E". "X" means NVML is unusable.
 
 Model :: #import "model";
-Channel :: #import "std/process_channel_linux";
+
 Files :: #import "std/file";
 Number :: #import "std/number_text";
 
@@ -39,6 +39,16 @@ GpuDeviceReadings :: struct {
     count: s32
 }
 
+#if #defined(TASKMGR_TAIJI) {
+#scope_export
+    shares: GpuShares;
+    devices: GpuDeviceReadings;
+    GpuSharesPoll :: (active: bool) {}
+    GpuSharesReady :: () -> bool { return false }
+    GpuSharesCurrent :: () -> *GpuShares { return *shares }
+    GpuDevicesCurrent :: () -> *GpuDeviceReadings { return *devices }
+} else {
+Channel :: #import "std/process_channel_linux";
 #scope_file
 
 c :: #system_library "c";
@@ -543,4 +553,6 @@ GpuSharesReset :: () {
     current.count = 0
     staging_devices.count = 0
     current_devices.count = 0
+}
+
 }

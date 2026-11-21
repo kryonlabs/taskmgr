@@ -1,0 +1,52 @@
+#scope_export
+// Platform policy selected at build time, never from host environment.
+#if #defined(TASKMGR_TAIJI) {
+    Tasks :: #import "taijios_tasks";
+    Surface :: #import "kryon/host/surface";
+} else {
+    Native :: #import "platform_linux";
+    Window :: #import "kryon/Window";
+}
+IsGuest :: () -> bool {
+#if #defined(TASKMGR_TAIJI) {
+    return true
+} else {
+    return false
+}
+}
+ProcessId :: () -> s32 {
+#if #defined(TASKMGR_TAIJI) {
+    return -1
+} else {
+    return Native.ProcessId()
+}
+}
+SysConf :: (name: s32) -> s64 {
+#if #defined(TASKMGR_TAIJI) {
+    return -1
+} else {
+    return Native.SysConf(name)
+}
+}
+SendSignal :: (pid: s32, signal: s32) -> s32 {
+#if #defined(TASKMGR_TAIJI) {
+    return Tasks.Terminate(pid)
+} else {
+    return Native.SendSignal(pid, signal)
+}
+}
+RunShell :: (command: *u8) -> s32 {
+#if #defined(TASKMGR_TAIJI) {
+    return -1
+} else {
+    return Native.RunShell(command)
+}
+}
+
+CloseWindow :: () {
+#if #defined(TASKMGR_TAIJI) {
+    Surface.Close()
+} else {
+    Window.WindowQuit()
+}
+}

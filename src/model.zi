@@ -6,138 +6,11 @@
 using Files :: #import "std/file";
 Number :: #import "std/number_text";
 
-libc :: #system_library "libc";
-SysConf :: (name: s32) -> s64 #foreign libc "sysconf";
-SendSignal :: (pid: s32, signal: s32) -> s32 #foreign libc "kill";
-ProcessId :: () -> s32 #foreign libc "getpid";
-RunShell :: (command: *u8) -> s32 #foreign libc "system";
+using Platform :: #import "task_platform";
 
-CLOCK_TICKS_NAME :: 2; // _SC_CLK_TCK
-PAGE_SIZE_NAME :: 30; // _SC_PAGESIZE
-STOP_SIGNAL :: 15; // SIGTERM
-
-// Keep the fixed snapshot bounded, but large enough for development hosts and
-// servers with several thousand visible processes. A lower cap silently hid
-// rows (including taskmgr's own test process) once /proc exceeded 1,024 PIDs.
-// Two thousand entries retain that headroom on the development host (which
-// runs roughly 1,400 processes) without keeping unused process and UI rows in
-// every retained generation.
-MAX_PROCESSES :: 2048;
-// Linux TASK_COMM_LEN is 16 including the terminator. Keep extra room for
-// synthetic group labels without doubling every process snapshot row.
-NAME_CAPACITY :: 32;
-COLUMNS :: 5;
-COMMAND_CAPACITY :: 1024;
-
-// Process table columns, in the classic task manager order.
-COLUMN_NAME :: 0;
-COLUMN_PID :: 1;
-COLUMN_CPU :: 2;
-COLUMN_CPU_TIME :: 3;
-COLUMN_MEMORY :: 4;
-
-// Samples kept for each Performance graph; one is taken per refresh.
-HISTORY_LENGTH :: 60;
-HISTORY_CPU :: 0;
-HISTORY_KERNEL :: 1;
-HISTORY_MEMORY :: 2;
-HISTORY_GPU :: 3;
-HISTORY_VRAM :: 4;
-MAX_GPUS :: 16;
-GPU_CARD_LIMIT :: 64;
-
-STATE_RUNNING :: 82; // R
-STATE_SLEEPING :: 83; // S
-STATE_WAITING :: 68; // D
-STATE_STOPPED :: 84; // T
-STATE_ZOMBIE :: 90; // Z
-STATE_IDLE :: 73; // I
-
-Process :: struct {
-    pid: s32
-    name_count: s32
-    name: [NAME_CAPACITY]u8
-    state: u8
-    // Parent PID from /proc/<pid>/stat field 4; it sits in the padding before
-    // cpu_percent, so the snapshot row does not grow.
-    ppid: s32
-    cpu_percent: float64
-    memory_bytes: u64
-    ticks: u64
-    threads: s32
-    // One for a raw process; more than one for an aggregated process group.
-    group_count: s32
-}
-
-GroupEndResult :: struct {
-    requested: s32
-    sent: s32
-    failed: s32
-}
-
-// Memory figures from /proc/meminfo, in kilobytes as the kernel reports them.
-// Commit charge is Committed_AS against CommitLimit; kernel memory is the slab
-// allocator, split into reclaimable (paged) and unreclaimable (nonpaged).
-MemoryDetails :: struct {
-    total_kb: s64
-    available_kb: s64
-    cache_kb: s64
-    commit_kb: s64
-    commit_limit_kb: s64
-    kernel_paged_kb: s64
-    kernel_nonpaged_kb: s64
-    swap_total_kb: s64
-    swap_free_kb: s64
-}
-
-// One stable DRM card. card_index comes from cardN, so labels and histories do
-// not change when directory enumeration order does. Unsupported counters stay
-// explicit instead of looking like 0% or 100% usage.
-GpuDevice :: struct {
-    card_index: s32
-    busy_supported: bool
-    busy_percent: float64
-    vram_supported: bool
-    vram_used: u64
-    vram_total: u64
-}
-
-Snapshot :: struct {
-    processes: [MAX_PROCESSES]Process
-    count: s32
-    cpu_percent: float64
-    kernel_percent: float64
-    memory_used: u64
-    memory_total: u64
-    busy_ticks: u64
-    kernel_ticks: u64
-    total_ticks: u64
-    threads: s64
-    // Allocated file handles from /proc/sys/fs/file-nr, or -1.
-    handles: s64
-    memory: MemoryDetails
-    gpu_percent: float64
-    gpus: [MAX_GPUS]GpuDevice
-    gpu_count: s32
-    gpu_supported_count: s32
-    vram_used: u64
-    vram_total: u64
-}
-
-// Group rows retain only the representative raw-process index and the values
-// that are actually aggregated for the process table. Keeping a third full
-// Snapshot duplicated every process name, state and GPU/system field.
-ProcessGroup :: struct {
-    process_index: s32
-    group_count: s32
-    cpu_percent: float64
-    memory_bytes: u64
-    ticks: u64
-}
-
-GroupedSnapshot :: struct {
-    groups: [MAX_PROCESSES]ProcessGroup
-    count: s32
+using Types :: #import "model_types";
+#if #defined(TASKMGR_TAIJI) {
+    Guest :: #import "platform_taiji";
 }
 
 state_names: [7]string = .{"Running", "Sleeping", "Waiting", "Stopped", "Zombie", "Idle", "Other"};
@@ -207,6 +80,10 @@ StateName :: (state: u8) -> string {
 // Reads a small file, such as a /proc entry, fully into a caller-owned buffer.
 // Returns the byte count, or -1 when the path cannot be opened.
 ReadSmall :: (path: string, buffer: []u8) -> s32 {
+#if #defined(TASKMGR_TAIJI) {
+    return -1
+} else {
+
     file := Files.OpenRead(path)
     if !file.valid { return -1 }
     total: s32 = 0
@@ -217,6 +94,8 @@ ReadSmall :: (path: string, buffer: []u8) -> s32 {
     }
     Files.CloseFile(file)
     return total
+
+}
 }
 
 StatPath :: (pid: s32, output: []u8) -> string {
@@ -569,6 +448,10 @@ GpuVramPercent :: (device: *GpuDevice) -> float64 {
 // with none of those files (NVIDIA's driver) uses the external reading for
 // its PCI address when one was set.
 ReadGpuStats :: (snapshot: *Snapshot) {
+#if #defined(TASKMGR_TAIJI) {
+    return
+} else {
+
     directory := Files.OpenDirectory("/sys/class/drm")
     busy_buffer: [128]u8
     used_buffer: [128]u8
@@ -608,6 +491,8 @@ ReadGpuStats :: (snapshot: *Snapshot) {
     }
     Files.CloseDirectory(*directory)
     FinalizeGpuStats(snapshot)
+
+}
 }
 
 LowerByte :: (byte: u8) -> u8 {
@@ -906,7 +791,15 @@ AppUsages :: (snapshot: *Snapshot, window_pids: []s32, gpu_pids: []s32,
 // arrays and system counters retained from the previous sample.
 #program_export
 Refresh :: () {
+#if #defined(TASKMGR_TAIJI) {
+    Guest.Sample(*snapshot)
+    BuildGroupedSnapshot(*snapshot, *grouped_snapshot)
+} else {
+
     EnsureTiming()
+    snapshot.processes_available = true
+    snapshot.cpu_available = false
+    snapshot.memory_available = false
     previous_count = snapshot.count
     if previous_count > 0 {
         for index: 0..previous_count - 1 {
@@ -943,6 +836,7 @@ Refresh :: () {
     if stat_length > 0 {
         sample_busy, sample_total, ok := CpuTotals(stat_buffer[0:stat_length])
         if ok {
+            target.cpu_available = true
             busy = sample_busy
             total_ticks = sample_total
             kernel_ticks = CpuKernelTicks(stat_buffer[0:stat_length])
@@ -954,6 +848,7 @@ Refresh :: () {
         total_kb := target.memory.total_kb
         available_kb := target.memory.available_kb
         if total_kb > 0 {
+            target.memory_available = true
             target.memory_total = cast(u64)total_kb * 1024
             if available_kb >= 0 && available_kb <= total_kb {
                 target.memory_used = (cast(u64)total_kb - cast(u64)available_kb) * 1024
@@ -1021,6 +916,8 @@ Refresh :: () {
         PushHistoryExtended(target.cpu_percent, target.kernel_percent, memory_percent,
             target.gpu_percent, vram_percent)
     }
+
+}
 }
 
 ClampPercent :: (value: float64) -> float32 {

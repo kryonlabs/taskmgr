@@ -21,6 +21,12 @@ AppList :: struct {
     available: bool
 }
 
+#if #defined(TASKMGR_TAIJI) {
+#scope_export
+    AppsRefresh :: (list: *AppList) { list.count = 0; list.available = false }
+    AppsSwitchTo :: (window: u64) -> bool { return false }
+    AppsCloseWindow :: (window: u64) -> bool { return false }
+} else {
 #scope_file
 
 c :: #system_library "c";
@@ -313,4 +319,6 @@ AppsSwitchTo :: (window: u64) -> bool {
 #program_export
 AppsCloseWindow :: (window: u64) -> bool {
     return SendClientMessage(window, close_atom, 0, SOURCE_PAGER)
+}
+
 }

@@ -1,0 +1,139 @@
+// Shared process model and bounded snapshot storage.
+CLOCK_TICKS_NAME :: 2; // _SC_CLK_TCK
+PAGE_SIZE_NAME :: 30; // _SC_PAGESIZE
+STOP_SIGNAL :: 15; // SIGTERM
+
+// Keep the fixed snapshot bounded, but large enough for development hosts and
+// servers with several thousand visible processes. A lower cap silently hid
+// rows (including taskmgr's own test process) once /proc exceeded 1,024 PIDs.
+// Two thousand entries retain that headroom on the development host (which
+// runs roughly 1,400 processes) without keeping unused process and UI rows in
+// every retained generation.
+// The guest service captures at most 1024 tasks. Linux retains its capacity.
+#if #defined(TASKMGR_TAIJI) {
+#scope_export
+MAX_PROCESSES :: 1024;
+} else {
+#scope_export
+MAX_PROCESSES :: 2048;
+}
+// Linux TASK_COMM_LEN is 16 including the terminator. Keep extra room for
+// synthetic group labels without doubling every process snapshot row.
+NAME_CAPACITY :: 32;
+COLUMNS :: 5;
+COMMAND_CAPACITY :: 1024;
+
+// Process table columns, in the classic task manager order.
+COLUMN_NAME :: 0;
+COLUMN_PID :: 1;
+COLUMN_CPU :: 2;
+COLUMN_CPU_TIME :: 3;
+COLUMN_MEMORY :: 4;
+
+// Samples kept for each Performance graph; one is taken per refresh.
+HISTORY_LENGTH :: 60;
+HISTORY_CPU :: 0;
+HISTORY_KERNEL :: 1;
+HISTORY_MEMORY :: 2;
+HISTORY_GPU :: 3;
+HISTORY_VRAM :: 4;
+MAX_GPUS :: 16;
+GPU_CARD_LIMIT :: 64;
+
+STATE_RUNNING :: 82; // R
+STATE_SLEEPING :: 83; // S
+STATE_WAITING :: 68; // D
+STATE_STOPPED :: 84; // T
+STATE_ZOMBIE :: 90; // Z
+STATE_IDLE :: 73; // I
+
+Process :: struct {
+    pid: s32
+    name_count: s32
+    name: [NAME_CAPACITY]u8
+    state: u8
+    memory_available: bool
+    // Parent PID from /proc/<pid>/stat field 4; it sits in the padding before
+    // cpu_percent, so the snapshot row does not grow.
+    ppid: s32
+    cpu_percent: float64
+    memory_bytes: u64
+    ticks: u64
+    threads: s32
+    // One for a raw process; more than one for an aggregated process group.
+    group_count: s32
+}
+
+GroupEndResult :: struct {
+    requested: s32
+    sent: s32
+    failed: s32
+}
+
+// Memory figures from /proc/meminfo, in kilobytes as the kernel reports them.
+// Commit charge is Committed_AS against CommitLimit; kernel memory is the slab
+// allocator, split into reclaimable (paged) and unreclaimable (nonpaged).
+MemoryDetails :: struct {
+    total_kb: s64
+    available_kb: s64
+    cache_kb: s64
+    commit_kb: s64
+    commit_limit_kb: s64
+    kernel_paged_kb: s64
+    kernel_nonpaged_kb: s64
+    swap_total_kb: s64
+    swap_free_kb: s64
+}
+
+// One stable DRM card. card_index comes from cardN, so labels and histories do
+// not change when directory enumeration order does. Unsupported counters stay
+// explicit instead of looking like 0% or 100% usage.
+GpuDevice :: struct {
+    card_index: s32
+    busy_supported: bool
+    busy_percent: float64
+    vram_supported: bool
+    vram_used: u64
+    vram_total: u64
+}
+
+Snapshot :: struct {
+    processes_available: bool
+    cpu_available: bool
+    memory_available: bool
+    processes: [MAX_PROCESSES]Process
+    count: s32
+    cpu_percent: float64
+    kernel_percent: float64
+    memory_used: u64
+    memory_total: u64
+    busy_ticks: u64
+    kernel_ticks: u64
+    total_ticks: u64
+    threads: s64
+    // Allocated file handles from /proc/sys/fs/file-nr, or -1.
+    handles: s64
+    memory: MemoryDetails
+    gpu_percent: float64
+    gpus: [MAX_GPUS]GpuDevice
+    gpu_count: s32
+    gpu_supported_count: s32
+    vram_used: u64
+    vram_total: u64
+}
+
+// Group rows retain only the representative raw-process index and the values
+// that are actually aggregated for the process table. Keeping a third full
+// Snapshot duplicated every process name, state and GPU/system field.
+ProcessGroup :: struct {
+    process_index: s32
+    group_count: s32
+    cpu_percent: float64
+    memory_bytes: u64
+    ticks: u64
+}
+
+GroupedSnapshot :: struct {
+    groups: [MAX_PROCESSES]ProcessGroup
+    count: s32
+}

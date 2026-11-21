@@ -1,0 +1,58 @@
+// Typed service fixtures test units, stale clearing, bounded refresh and target IDs.
+Model :: #import "model";
+mode: s32;
+terminated: s32;
+#program_export
+Capture :: () -> s32 { return ifx mode == 1 then -1 else 2 }
+#program_export
+TaskAt :: (index: s32, fields: []s64, name: []u8, user: []u8) -> s32 {
+    if mode == 2 && index == 1 { return -1 }
+    fields[0] = 100 + index
+    fields[1] = 7
+    fields[2] = 4
+    fields[3] = ifx index == 0 then 12 else -1
+    name[0] = cast(u8)(65 + index)
+    name[1] = 0
+    user[0] = 0
+    return 0
+}
+#program_export
+PoolAt :: (index: s32, fields: []s64) -> s32 {
+    if mode == 3 { return -1 }
+    fields[0] = 4096
+    fields[1] = 33554432
+    fields[2] = 8192
+    return 0
+}
+#program_export
+Terminate :: (pid: s32) -> s32 { terminated = pid; return 0 }
+#program_export
+main :: () -> s32 {
+    max_bytes: [14]u8
+    full_bytes: [32]u8
+    maximum := cast(u64)18446744073709551615
+    if Model.FormatBytes(maximum, max_bytes[:]) != Model.FormatBytes(maximum, full_bytes[:]) { return 12 }
+    for sample: 0..999 {
+        Model.Refresh()
+        snapshot := Model.Current()
+        if !snapshot.processes_available || snapshot.count != 2 { return 1 }
+        if snapshot.cpu_available || !snapshot.memory_available { return 2 }
+        if snapshot.memory_used != 4096 || snapshot.memory_total != 33554432 { return 3 }
+        if snapshot.processes[0].pid != 100 || snapshot.processes[0].memory_bytes != 12288 { return 4 }
+        if snapshot.processes[1].memory_available { return 5 }
+    }
+    if !Model.EndTask(101) || terminated != 101 { return 6 }
+    if Model.EndTask(0) || terminated != 101 { return 7 }
+    if Model.StartTask("host command must not execute") { return 8 }
+    mode = 1
+    Model.Refresh()
+    if Model.Current().processes_available || Model.Current().count != 0 { return 9 }
+    mode = 2
+    Model.Refresh()
+    if Model.Current().processes_available || Model.Current().count != 0 { return 10 }
+    mode = 3
+    Model.Refresh()
+    if Model.Current().memory_available || Model.Current().memory_used != 0 { return 11 }
+    print("taskmgr Taiji adapter tests passed\n")
+    return 0
+}

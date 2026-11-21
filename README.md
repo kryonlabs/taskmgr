@@ -85,3 +85,33 @@ several process and retained-text refreshes, then enforces a 30 MiB RSS cap.
 The desktop profile opens an SDL2 window through Kryon's `desktop` backend.
 The `tui`, `web`, `portable`, and headless `shot` profiles use the same
 application `Frame` declared in `ziran.toml`.
+
+## TaijiOS ZX
+
+The same `app:Frame`, process model, sorting and selection run on TaijiOS.
+The small `taiji_host` entry uses canonical `kryon/host/surface`; it contains
+no UI. `platform_taiji` reads only the typed `taijios_tasks` host service.
+Linux keeps its existing `/proc`, EWMH, GPU helper and native host behavior.
+
+```sh
+TAIJIOS_TASK_MODULES=/path/to/taijios/appl/cmd make taiji-test taiji
+```
+
+This writes `build/taskmgr.zx`. The Taiji launcher owner installs that artifact
+with its existing `TASKMGR_ZX` integration; this repository does not modify the
+emulator, menu or launcher. The guest requires `/prog` plus `taijios_tasks`,
+Kryon's software surface/pixmap and monotonic clock host capabilities.
+
+Guest PID values identify Dis tasks. `Est. Memory` is the guest's Dis
+stack/module estimate in KiB, converted to bytes for display; it is not RSS.
+The status and Performance memory reading is the real main allocator pool in
+bytes against its configured limit, not total system RAM. CPU percentages,
+CPU time, Linux windows, GPU and unsupported counters are explicitly unavailable.
+The guest has no shell launch or group termination. End Process targets only
+the selected captured guest PID through the native `/prog/PID/ctl` operation.
+Refresh storage and task count are bounded; failed captures clear visible rows.
+
+`make taiji-test` runs 1,000 service-fixture refreshes, unit conversion,
+unavailable/stale handling and selected-PID control through a ZX bundle.
+Actual guest GUI lifecycle and the default 32 MiB pool measurement are separate
+integration tests owned by the Taiji launcher task.

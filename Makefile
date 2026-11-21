@@ -48,3 +48,17 @@ shot: build
 
 clean:
 	rm -rf build
+
+# The Taiji owner supplies the canonical typed host module directory.
+.PHONY: taiji taiji-test
+taiji:
+	./scripts/package-taiji.sh
+
+taiji-test:
+	$(ZIRAN) bundle --project --define TASKMGR_TAIJI --module-path "$(TAIJIOS_TASK_MODULES)" --entry taiji_model_test:main \
+	    --bind taijios_tasks:Capture=taiji_model_test:Capture \
+	    --bind taijios_tasks:TaskAt=taiji_model_test:TaskAt \
+	    --bind taijios_tasks:PoolAt=taiji_model_test:PoolAt \
+	    --bind taijios_tasks:Terminate=taiji_model_test:Terminate \
+	    -o build/taiji-model-test.zx tests/taiji_model_test.zi
+	$(ZIRAN) run build/taiji-model-test.zx

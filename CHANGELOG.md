@@ -4,6 +4,8 @@
 
 ### Added
 
+- Run the shared Task Manager interface on TaijiOS ZX with real guest tasks,
+  allocator memory, selected-task control and bounded platform sampling.
 - Clicking an application expands it to the processes it owns, each with its
   state, CPU, memory and GPU use.
 - AMD, Intel and other GPUs with standard DRM fdinfo counters now report

@@ -408,30 +408,34 @@ HistoryTest :: () -> bool {
     Model.PushHistory(150.0, -5.0, 41.5)
     Model.PushHistory(30.0, 3.0, 42.0)
     values: [Model.HISTORY_LENGTH]float32
-    cpu := Model.History(Model.HISTORY_CPU, values[:])
     last := Model.HISTORY_LENGTH - 1
+    cpu := Model.History(Model.HISTORY_CPU, values[:])
     if cast(s32)cpu.count != Model.HISTORY_LENGTH || cpu[last] != 30.0 ||
        cpu[last - 1] != 100.0 || cpu[last - 2] != 10.0 {
         print("history: cpu samples wrong or unclamped\n")
         return false
     }
-    kernel := Model.History(Model.HISTORY_KERNEL, values[:])
+    kernel_values: [Model.HISTORY_LENGTH]float32
+    kernel := Model.History(Model.HISTORY_KERNEL, kernel_values[:])
     if kernel[last] != 3.0 || kernel[last - 1] != 0.0 {
         print("history: kernel samples wrong\n")
         return false
     }
-    memory := Model.History(Model.HISTORY_MEMORY, values[:])
+    memory_values: [Model.HISTORY_LENGTH]float32
+    memory := Model.History(Model.HISTORY_MEMORY, memory_values[:])
     if memory[last] != 42.0 || memory[last - 1] != 41.5 {
         print("history: memory samples wrong\n")
         return false
     }
     Model.PushHistoryExtended(11.0, 4.0, 43.0, 67.0, 81.0)
-    gpu := Model.History(Model.HISTORY_GPU, values[:])
+    gpu_values: [Model.HISTORY_LENGTH]float32
+    gpu := Model.History(Model.HISTORY_GPU, gpu_values[:])
     if gpu[last] != 67.0 {
         print("history: GPU sample wrong\n")
         return false
     }
-    vram := Model.History(Model.HISTORY_VRAM, values[:])
+    vram_values: [Model.HISTORY_LENGTH]float32
+    vram := Model.History(Model.HISTORY_VRAM, vram_values[:])
     if vram[last] != 81.0 {
         print("history: VRAM sample wrong\n")
         return false
@@ -440,7 +444,8 @@ HistoryTest :: () -> bool {
     for step: 0..Model.HISTORY_LENGTH + 4 {
         Model.PushHistory(cast(float64)(step % 100), 0.0, 0.0)
     }
-    wrapped := Model.History(Model.HISTORY_CPU, values[:])
+    wrapped_values: [Model.HISTORY_LENGTH]float32
+    wrapped := Model.History(Model.HISTORY_CPU, wrapped_values[:])
     newest := cast(float32)((Model.HISTORY_LENGTH + 4) % 100)
     if wrapped[last] != newest || wrapped[0] != newest - cast(float32)(Model.HISTORY_LENGTH - 1) {
         print("history: wrapped samples out of order\n")

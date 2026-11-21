@@ -1,15 +1,39 @@
-using UI :: #import "Widgets";
+Button :: #import "kryon/button";
+Text :: #import "kryon/text";
+Box :: #import "kryon/box";
+Fieldset :: #import "kryon/fieldset";
+Menu :: #import "kryon/menu";
+Modal :: #import "kryon/modal";
+TextField :: #import "kryon/text_field";
+#import "kryon/geometry"
+#import "kryon/session"
+#import "kryon/control_props"
+#import "kryon/drawing_props"
+#import "kryon/text_align"
+#import "kryon/key_input"
+#import "kryon/tree_input"
+#import "kryon/tree"
+#import "kryon/paint_queue"
+#import "std/byte_text_linux"
 using Model :: #import "model";
 Apps :: #import "windows";
 Gpu :: #import "gpu_processes";
+#if !#defined(TASKMGR_TAIJI) {
 GpuDrm :: #import "gpu_drm";
+}
 Tables :: #import "data_views/TableView";
 Theme :: #import "kryon/Theme";
 SystemTheme :: #import "kryon/SystemTheme";
-SystemThemeHostLinux :: #import "kryon/SystemThemeHostLinux";
+
 Window :: #import "kryon/Window";
 Number :: #import "std/number_text";
-Timer :: #import "std/timer_linux";
+Platform :: #import "task_platform";
+#if !#defined(TASKMGR_TAIJI) {
+    SystemThemeHostLinux :: #import "kryon/SystemThemeHostLinux";
+    Timer :: #import "std/timer_linux";
+} else {
+    GuestClock :: #import "kryon/Clock";
+}
 Shortcuts :: #import "app_shortcuts";
 #import "layout"
 
@@ -24,12 +48,15 @@ Shortcuts :: #import "app_shortcuts";
 //
 // TASKMGR_TAB=applications|processes|performance picks the starting tab.
 
+#if !#defined(TASKMGR_TAIJI) {
 libc :: #system_library "libc";
 // SystemThemeHostLinux reads the supervising X11 container palette. Keep its
 // native library on the final application link as well as inside the module.
 theme_x11 :: #system_library "X11";
 Environment :: (name: *u8) -> *u8 #foreign libc "getenv";
 ThemeXInitThreads :: () -> s32 #foreign theme_x11 "XInitThreads";
+
+}
 
 TAB_APPLICATIONS :: 0;
 TAB_PROCESSES :: 1;
@@ -73,11 +100,19 @@ APP_COLUMN_GPU :: 4;
 // Ten-digit PIDs, percentages, elapsed times and adaptive byte values fit in
 // 16 bytes; process/group names use the model's bounded 32-byte capacity.
 CELL_WIDTH :: 16;
+// Column bounds: signed 32-bit PID, normalized whole CPU %, adaptive u64 bytes.
+PID_CELL_WIDTH :: 11;
+CPU_CELL_WIDTH :: 4;
+MEMORY_CELL_WIDTH :: 14;
 NAME_WIDTH :: Model.NAME_CAPACITY;
 STATUS_WIDTH :: 160;
 // A flattened grouped table contains every raw process plus at most one header
 // per two members: singleton groups use their raw row directly.
+#if #defined(TASKMGR_TAIJI) {
+MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES;
+} else {
 MAX_DISPLAY_ROWS :: Model.MAX_PROCESSES + Model.MAX_PROCESSES / 2;
+}
 
 process_columns: [5]string = .{"Image Name", "PID", "CPU", "CPU Time", "Memory"};
 process_fractions: [5]float32 = .{0.40, 0.12, 0.10, 0.16, 0.22};
@@ -116,10 +151,10 @@ expanded_count: s32;
 CellText :: struct {
     cell: [MAX_DISPLAY_ROWS * COLUMNS]string
     name: [MAX_DISPLAY_ROWS * NAME_WIDTH]u8
-    pid: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
-    cpu: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+    pid: [MAX_DISPLAY_ROWS * PID_CELL_WIDTH]u8
+    cpu: [MAX_DISPLAY_ROWS * CPU_CELL_WIDTH]u8
     time: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
-    mem: [MAX_DISPLAY_ROWS * CELL_WIDTH]u8
+    mem: [MAX_DISPLAY_ROWS * MEMORY_CELL_WIDTH]u8
 }
 
 text_stores_a: CellText;
@@ -129,6 +164,7 @@ text_active: s32;
 // Window manager task lists, also in two generations. A window row totals its
 // process tree (see Model.AppUsages); an expanded window lists those
 // processes under it. process is -1 on a window row.
+#if !#defined(TASKMGR_TAIJI) {
 APP_ROWS :: Apps.MAX_WINDOWS + Model.MAX_PROCESSES;
 TASK_WIDTH :: Apps.TITLE_CAPACITY + 8;
 
@@ -149,7 +185,6 @@ AppText :: struct {
 }
 
 app_pids: [Apps.MAX_WINDOWS]s32;
-no_external_gpus: [1]Model.GpuExternal;
 app_usage: [Apps.MAX_WINDOWS]Model.AppUsage;
 tree_pids: [Model.MAX_PROCESSES]s32;
 // NVML and DRM per-process GPU shares, merged for the current refresh.
@@ -164,10 +199,14 @@ expanded_window_count: s32;
 app_stores_a: AppText;
 app_stores_b: AppText;
 app_active: s32;
+} else {
+app_gpu_shown: bool;
+}
+no_external_gpus: [1]Model.GpuExternal;
 
 current_tab: s32 = TAB_PROCESSES;
 started: bool;
-menu_state: MenuState;
+menu_state: Menu.MenuState;
 
 sort_column: s32 = Model.COLUMN_CPU;
 sort_direction: s32 = -1;
@@ -219,10 +258,6 @@ palette_base: u32;
 palette_text: u32;
 palette_border: u32;
 
-Color32 :: (packed: u32) -> Color {
-    return ColorFromPacked(packed)
-}
-
 PaletteLayer :: (opacity: u32) -> u32 {
     return Theme.StateLayer(palette_background, palette_text, opacity)
 }
@@ -247,7 +282,7 @@ Inset :: (bounds: Rectangle, amount: float32) -> Rectangle {
 
 TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
     accent: bool, disabled: bool) -> bool {
-    props: ButtonProps
+    props: Button.Props
     props.key = cast(u64)id
     props.id = id
     props.bounds = bounds
@@ -259,21 +294,25 @@ TaskButton :: (session: Session, id: s32, label: string, bounds: Rectangle,
         props.tone = ButtonTone.ButtonToneAccent
         props.emphasis = ButtonEmphasis.ButtonEmphasisFilled
     }
-    return Button(session, props) == 1
+    return Button.Draw(session, props) == 1
 }
 
 ValueLabel :: (session: Session, key: s32, text: string, bounds: Rectangle, font: s32) {
-    Text(session, TextProps.{.key = cast(u64)key, .bounds = bounds, .text = text, .font = font,
+    Text.Draw(session, Text.Props.{.key = cast(u64)key, .bounds = bounds, .text = text, .size = font,
         .align = TextAlign.TextAlignEnd})
 }
 
 CenteredLabel :: (session: Session, key: s32, text: string, bounds: Rectangle, font: s32) {
-    Text(session, TextProps.{.key = cast(u64)key, .bounds = bounds, .text = text, .font = font,
+    Text.Draw(session, Text.Props.{.key = cast(u64)key, .bounds = bounds, .text = text, .size = font,
         .align = TextAlign.TextAlignCenter})
 }
 
 // Picks the starting tab from TASKMGR_TAB, matching its first letter.
 StartingTab :: () -> s32 {
+#if #defined(TASKMGR_TAIJI) {
+    return TAB_PROCESSES
+} else {
+
     variable := "TASKMGR_TAB"
     name: [16]u8
     length: s32 = 0
@@ -289,6 +328,8 @@ StartingTab :: () -> s32 {
     if first == 112 && value[1] == 101 { return TAB_PERFORMANCE }
     if first == 80 && value[1] == 101 { return TAB_PERFORMANCE }
     return TAB_PROCESSES
+
+}
 }
 
 // Group names are retained as bytes, never as string views into refreshed
@@ -444,14 +485,19 @@ RebuildOrder :: (store: *CellText) {
             store.cell[base + Model.COLUMN_PID] = "-"
         } else {
             store.cell[base + Model.COLUMN_PID] = Number.FormatInteger(cast(s64)entry.pid,
-                store.pid[cell:cell + CELL_WIDTH])
+                store.pid[index * PID_CELL_WIDTH:(index + 1) * PID_CELL_WIDTH])
         }
         store.cell[base + Model.COLUMN_CPU] = Model.FormatCpu(entry.cpu_percent,
-            store.cpu[cell:cell + CELL_WIDTH])
+            store.cpu[index * CPU_CELL_WIDTH:(index + 1) * CPU_CELL_WIDTH])
         store.cell[base + Model.COLUMN_CPU_TIME] = Model.FormatCpuTime(entry.ticks,
             store.time[cell:cell + CELL_WIDTH])
         store.cell[base + Model.COLUMN_MEMORY] = Model.FormatBytes(entry.memory_bytes,
-            store.mem[cell:cell + CELL_WIDTH])
+            store.mem[index * MEMORY_CELL_WIDTH:(index + 1) * MEMORY_CELL_WIDTH])
+        if Platform.IsGuest() {
+            store.cell[base + Model.COLUMN_CPU] = "n/a"
+            store.cell[base + Model.COLUMN_CPU_TIME] = "n/a"
+            if !entry.memory_available { store.cell[base + Model.COLUMN_MEMORY] = "n/a" }
+        }
     }
 }
 
@@ -467,6 +513,7 @@ BuildOrder :: () {
 
 // The Status column: a window whose process the kernel has stopped cannot
 // answer, as a hung program could not on the classic task manager.
+#if !#defined(TASKMGR_TAIJI) {
 AppStatus :: (pid: s32) -> string {
     if pid <= 0 { return "Running" }
     snapshot := Model.Current()
@@ -654,6 +701,10 @@ AppColumnCount :: () -> s32 {
     return ifx app_gpu_shown then APP_COLUMNS else APP_COLUMNS - 1
 }
 
+} else {
+BuildApps :: (sample: bool = true) {}
+}
+
 // Copies the message parts into the raw status bytes for later frames.
 SetStatus :: (parts: []string) {
     length: s32 = 0
@@ -693,50 +744,52 @@ ColumnWidths :: (width: float32) {
 }
 
 MenuBar :: (session: Session, bounds: Rectangle) -> s32 {
-    if !menu_state.initialized { MenuStateInit(*menu_state) }
-    file_items: [3]MenuItem
+    if !menu_state.initialized { Menu.MenuStateInit(*menu_state) }
+    file_items: [3]Menu.MenuItem
     file_items[0].id = MENU_NEW_TASK
     file_items[0].label = "New Task (Run...)"
-    file_items[1].kind = MenuItemKind.MenuSeparator
+    file_items[0].disabled = Platform.IsGuest()
+    file_items[1].kind = Menu.MenuItemKind.MenuSeparator
     file_items[2].id = MENU_EXIT
     file_items[2].label = "Exit Task Manager"
 
-    option_items: [2]MenuItem
-    option_items[0].kind = MenuItemKind.MenuCheck
+    option_items: [2]Menu.MenuItem
+    option_items[0].kind = Menu.MenuItemKind.MenuCheck
     option_items[0].id = MENU_CONFIRM_END
     option_items[0].label = "Confirm Before Ending Processes"
     option_items[0].checked = confirm_end
-    option_items[1].kind = MenuItemKind.MenuCheck
+    option_items[1].kind = Menu.MenuItemKind.MenuCheck
     option_items[1].id = MENU_GROUP_PROCESSES
     option_items[1].label = "Group Processes"
     option_items[1].checked = group_processes
+    option_items[1].disabled = Platform.IsGuest()
 
-    speed_items: [4]MenuItem
+    speed_items: [4]Menu.MenuItem
     speed_labels: [4]string = .{"High", "Normal", "Low", "Paused"}
     speed_values: [4]s64 = .{SPEED_HIGH_MS, SPEED_NORMAL_MS, SPEED_LOW_MS, 0}
     for index: 0..3 {
-        speed_items[index].kind = MenuItemKind.MenuRadio
+        speed_items[index].kind = Menu.MenuItemKind.MenuRadio
         speed_items[index].id = MENU_SPEED_HIGH + cast(s32)index
         speed_items[index].label = speed_labels[index]
         speed_items[index].checked = refresh_interval_ms == speed_values[index]
     }
-    view_items: [4]MenuItem
+    view_items: [4]Menu.MenuItem
     view_items[0].id = MENU_REFRESH
     view_items[0].label = "Refresh Now"
-    view_items[1].kind = MenuItemKind.MenuSubmenu
+    view_items[1].kind = Menu.MenuItemKind.MenuSubmenu
     view_items[1].label = "Update Speed"
     view_items[1].submenu = speed_items[:]
-    view_items[2].kind = MenuItemKind.MenuSeparator
-    view_items[3].kind = MenuItemKind.MenuCheck
+    view_items[2].kind = Menu.MenuItemKind.MenuSeparator
+    view_items[3].kind = Menu.MenuItemKind.MenuCheck
     view_items[3].id = MENU_KERNEL_TIMES
     view_items[3].label = "Show Kernel Times"
     view_items[3].checked = show_kernel_times
 
-    help_items: [1]MenuItem
+    help_items: [1]Menu.MenuItem
     help_items[0].id = MENU_ABOUT
     help_items[0].label = "About Task Manager"
 
-    groups: [4]MenuGroup
+    groups: [4]Menu.MenuGroup
     groups[0].label = "File"
     groups[0].items = file_items[:]
     groups[1].label = "Options"
@@ -745,14 +798,14 @@ MenuBar :: (session: Session, bounds: Rectangle) -> s32 {
     groups[2].items = view_items[:]
     groups[3].label = "Help"
     groups[3].items = help_items[:]
-    return Menu(session, MenuProps.{.key = 20, .bounds = bounds}, groups[:], *menu_state).activated_id
+    return Menu.Draw(session, Menu.Props.{.key = 20, .bounds = bounds}, groups[:], *menu_state).activated_id
 }
 
 RunMenu :: (id: s32) {
     if id == MENU_NEW_TASK { OpenRunDialog() }
-    if id == MENU_EXIT { Window.WindowQuit() }
+    if id == MENU_EXIT { Platform.CloseWindow() }
     if id == MENU_CONFIRM_END { confirm_end = !confirm_end }
-    if id == MENU_GROUP_PROCESSES {
+    if id == MENU_GROUP_PROCESSES && !Platform.IsGuest() {
         group_processes = !group_processes
         selected_row = -1
         selected_pid = -1
@@ -772,6 +825,7 @@ RunMenu :: (id: s32) {
 }
 
 OpenRunDialog :: () {
+    if Platform.IsGuest() { SetStatusText("Task launch unavailable on Taiji."); return }
     dialog = DIALOG_RUN
     command_pending = false
     command_length = 0
@@ -782,7 +836,7 @@ OpenRunDialog :: () {
 
 // Writes the field's text with one edit applied into command_next; the next
 // frame's SettleCommand copies it back.
-ApplyEdit :: (length: s32, edit: TextFieldEdit) -> s32 {
+ApplyEdit :: (length: s32, edit: TextField.Edit) -> s32 {
     if !edit.changed { return length }
     if edit.start < 0 || edit.end < edit.start || edit.end > length { return length }
     new_length := length - (edit.end - edit.start) + cast(s32)edit.replacement.count
@@ -824,7 +878,7 @@ RunCommand :: () {
 
 RunDialog :: (session: Session, font: s32) {
     SettleCommand()
-    modal := ModalFrame(session, ModalFrameProps.{.key = 300, .title = "Create New Task",
+    modal := Modal.Draw(session, Modal.Props.{.key = 300, .title = "Create New Task",
         .width = 460, .height = 210, .left_label = "Cancel", .right_label = "OK",
         .has_left_action = true, .has_right_action = true})
     commit := modal.right_clicked
@@ -835,7 +889,7 @@ RunDialog :: (session: Session, font: s32) {
         key := KeyboardTake(session)
         text := TypedTextTake(session, typed[:])
         input := TextFieldInputFor(key, KeyboardModifiers(session), text)
-        result := TextField(session, TextFieldProps.{.key = 302, .id = 302,
+        result := TextField.Draw(session, TextField.Props.{.key = 302, .id = 302,
             .bounds = .{area.x, area.y + 30.0, area.width, 36.0},
             .value = TextView(command_bytes[0:command_length]), .label = "Open",
             .placeholder = "for example: xterm", .max_bytes = Model.COMMAND_CAPACITY,
@@ -854,11 +908,11 @@ RunDialog :: (session: Session, font: s32) {
 }
 
 AboutDialog :: (session: Session) {
-    actions: [1]ActionModalAction
+    actions: [1]Modal.ActionModalAction
     actions[0].label = "OK"
     actions[0].tone = ButtonTone.ButtonToneAccent
     actions[0].emphasis = ButtonEmphasis.ButtonEmphasisFilled
-    answer := ActionModal(session, ActionModalProps.{.key = 310, .title = "About Task Manager",
+    answer := Modal.ActionModal(session, Modal.ActionModalProps.{.key = 310, .title = "About Task Manager",
         .message = "taskmgr shows the applications, processes and performance of this Linux computer. It reads /proc directly and lists windows from the X11 window manager.",
         .max_width = 440}, actions[:])
     if answer.action != 0 { dialog = DIALOG_NONE }
@@ -965,18 +1019,21 @@ EndProcessDialog :: (session: Session) {
             Number.FormatInteger(cast(s64)end_pid, pid_line[:]), ")?"}
         message = JoinAll(parts[:], process_message_line[:])
     }
-    actions: [2]ActionModalAction
+    actions: [2]Modal.ActionModalAction
     actions[0].label = "No"
     actions[1].label = "Yes"
     actions[1].tone = ButtonTone.ButtonToneDanger
     actions[1].emphasis = ButtonEmphasis.ButtonEmphasisFilled
-    answer := ActionModal(session, ActionModalProps.{.key = 320, .title = "Task Manager Warning",
+    answer := Modal.ActionModal(session, Modal.ActionModalProps.{.key = 320, .title = "Task Manager Warning",
         .message = message, .max_width = 460}, actions[:])
     if answer.action == 2 { EndSelectedTarget() }
     if answer.action != 0 { dialog = DIALOG_NONE }
 }
 
 ApplicationsTab :: (session: Session, area: Rectangle) {
+#if #defined(TASKMGR_TAIJI) {
+    CenteredLabel(session, 205, "Window task lists are unavailable on TaijiOS.", area, 14)
+} else {
     store := ActiveAppText()
     list := *store.list
     table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
@@ -1041,9 +1098,14 @@ ApplicationsTab :: (session: Session, area: Rectangle) {
         OpenRunDialog()
     }
 }
+}
 
 ProcessesTab :: (session: Session, area: Rectangle) {
     raw := Model.Current()
+    if !raw.processes_available {
+        Label(session, 109, "Guest process service unavailable", area, 14)
+        return
+    }
     grouped_snapshot := Model.GroupedCurrent()
     table_bounds := Rectangle.{area.x, area.y, area.width, area.height - BUTTON_HEIGHT - PAD}
     if table_bounds.height < 60.0 { table_bounds.height = 60.0 }
@@ -1095,7 +1157,7 @@ ProcessesTab :: (session: Session, area: Rectangle) {
     }
 
     button_y := area.y + area.height - BUTTON_HEIGHT
-    none := selected_pid <= 0 && !selected_is_group
+    none := (Platform.IsGuest() && selected_is_group) || (selected_pid <= 0 && !selected_is_group)
     button_label: string = "End Process"
     if selected_is_group { button_label = "End Group" }
     if TaskButton(session, 110, button_label, .{area.x + area.width - BUTTON_WIDTH, button_y,
@@ -1140,7 +1202,7 @@ DrawHistorySeries :: (session: Session, inner: Rectangle, series: []float32, col
             x1 := inner.x + inner.width * cast(float32)index / cast(float32)(count - 1)
             y0 := inner.y + inner.height * (1.0 - series[index - 1] / 100.0)
             y1 := inner.y + inner.height * (1.0 - series[index] / 100.0)
-            PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0}, Color32(color))
+            PaintLine(session, -1, .{x0, y0, x1 - x0, y1 - y0}, ColorFromPacked(color))
         }
     }
 }
@@ -1175,9 +1237,9 @@ GpuLegend :: (device: *Model.GpuDevice, kind: s32, output: []u8) -> string {
 HistoryGraph :: (session: Session, key: s32, bounds: Rectangle, label: string, kind: s32,
     font: s32, with_kernel: bool) {
     border := GraphColor(kind, 0)
-    Box(session, BoxProps.{.key = cast(u64)key, .bounds = bounds,
-        .fill = Color32(cast(u32)0x000000ff),
-        .border = Color32(border), .radius = 0.0})
+    Box.Draw(session, Box.Props.{.key = cast(u64)key, .bounds = bounds,
+        .fill = ColorFromPacked(cast(u32)0x000000ff),
+        .border = ColorFromPacked(border), .radius = 0.0})
     inner := Rectangle.{bounds.x + 2.0, bounds.y + 2.0,
         bounds.width - 4.0, bounds.height - 4.0}
     if kind == Model.HISTORY_GPU || kind == Model.HISTORY_VRAM {
@@ -1200,10 +1262,10 @@ HistoryGraph :: (session: Session, key: s32, bounds: Rectangle, label: string, k
                     inner.y + 2.0 + cast(float32)device_index * 16.0,
                     inner.width - 6.0, 15.0}
                 PaintLine(session, -1, .{row.x + 3.0, row.y + 7.0, 8.0, 0.0},
-                    Color32(color))
+                    ColorFromPacked(color))
                 PaintClippedLabel(session, -1, GpuLegend(device, kind, legend[:]),
                     cast(s32)(row.x + 15.0), cast(s32)row.y, font,
-                    Color32(color), inner)
+                    ColorFromPacked(color), inner)
             }
         }
     } else {
@@ -1234,7 +1296,7 @@ GroupContent :: (bounds: Rectangle) -> Rectangle {
 PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: string,
     semantic_label: string, history_kind: s32, reading: string, font: s32,
     with_kernel: bool) {
-    Fieldset(session, FieldsetProps.{.key = cast(u64)key, .bounds = bounds, .title = title})
+    Fieldset.Draw(session, Fieldset.Props.{.key = cast(u64)key, .bounds = bounds, .title = title})
     content := GroupContent(bounds)
     reading_height: float32 = 18.0
     graph := Rectangle.{content.x, content.y, content.width, content.height - reading_height - 3.0}
@@ -1245,6 +1307,15 @@ PerformanceGraph :: (session: Session, key: s32, bounds: Rectangle, title: strin
 }
 
 PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
+    if Platform.IsGuest() {
+        bytes: [32]u8
+        Label(session, 449, "Guest main pool allocated (CPU unavailable)", area, font)
+        reading := "n/a"
+        if Model.Current().memory_available { reading = Model.FormatBytes(Model.Current().memory_used, bytes[:]) }
+        Label(session, 450, reading,
+            .{area.x, area.y + 40.0, area.width, 30.0}, font)
+        return
+    }
     snapshot := Model.Current()
         half := (area.width - PAD) / 2.0
         info_height: float32 = 92.0
@@ -1297,14 +1368,14 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         b: [32]u8
         c: [32]u8
         totals := Rectangle.{area.x, info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 440, .bounds = totals, .title = "Totals"})
+        Fieldset.Draw(session, Fieldset.Props.{.key = 440, .bounds = totals, .title = "Totals"})
         totals_area := GroupContent(totals)
         InfoRow(session, 441, totals_area, 0, "Handles", Model.FormatThousands(snapshot.handles, a[:]), font)
         InfoRow(session, 443, totals_area, 1, "Threads", Model.FormatThousands(snapshot.threads, b[:]), font)
         InfoRow(session, 445, totals_area, 2, "Processes", Model.FormatThousands(cast(s64)snapshot.count, c[:]), font)
 
         physical := Rectangle.{right_x, info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 450, .bounds = physical, .title = "Physical Memory"})
+        Fieldset.Draw(session, Fieldset.Props.{.key = 450, .bounds = physical, .title = "Physical Memory"})
         physical_area := GroupContent(physical)
         d: [32]u8
         e: [32]u8
@@ -1315,7 +1386,7 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
 
         second_info_y := info_y + info_height + PAD
         commit := Rectangle.{area.x, second_info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 460, .bounds = commit, .title = "Commit Charge"})
+        Fieldset.Draw(session, Fieldset.Props.{.key = 460, .bounds = commit, .title = "Commit Charge"})
         commit_area := GroupContent(commit)
         g: [32]u8
         h: [32]u8
@@ -1325,7 +1396,7 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
         InfoRow(session, 465, commit_area, 2, "Peak", Model.FormatKilobytesBytes(Model.CommitPeakKb(), i[:]), font)
 
         kernel := Rectangle.{right_x, second_info_y, half, info_height}
-        Fieldset(session, FieldsetProps.{.key = 470, .bounds = kernel, .title = "Kernel Memory"})
+        Fieldset.Draw(session, Fieldset.Props.{.key = 470, .bounds = kernel, .title = "Kernel Memory"})
         kernel_area := GroupContent(kernel)
         j: [32]u8
         k: [32]u8
@@ -1344,8 +1415,8 @@ PerformanceTab :: (session: Session, area: Rectangle, font: s32) {
 StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
     theme := Theme.CurrentTheme()
     snapshot := Model.Current()
-    Box(session, BoxProps.{.key = 500, .bounds = bounds, .fill = Color32(PaletteLayer(5)),
-        .border = Color32(palette_border)})
+    Box.Draw(session, Box.Props.{.key = 500, .bounds = bounds, .fill = ColorFromPacked(PaletteLayer(5)),
+        .border = ColorFromPacked(palette_border)})
     count_line: [16]u8
     processes_line: [48]u8
     processes_parts: [2]string = .{"Processes: ", Number.FormatInteger(cast(s64)snapshot.count, count_line[:])}
@@ -1359,13 +1430,16 @@ StatusBar :: (session: Session, bounds: Rectangle, font: s32) {
         " / ", Model.FormatBytes(snapshot.memory_total, total_line[:])}
     texts: [3]string = .{JoinAll(processes_parts[:], processes_line[:]),
         JoinAll(cpu_parts[:], cpu_text[:]), JoinAll(memory_parts[:], memory_text[:])}
+    if !snapshot.processes_available { texts[0] = "Processes: n/a" }
+    if !snapshot.cpu_available { texts[1] = "CPU: n/a" }
+    if !snapshot.memory_available { texts[2] = "Memory: n/a" }
     widths: [3]float32 = .{0.24, 0.24, 0.52}
     x := bounds.x + 4.0
     for index: 0..2 {
         width := (bounds.width - 16.0) * widths[index]
         pane := Rectangle.{x, bounds.y + 3.0, width, bounds.height - 6.0}
-        Box(session, BoxProps.{.key = cast(u64)(501 + cast(s32)index * 2), .bounds = pane,
-            .fill = Color32(palette_background), .border = Color32(palette_border),
+        Box.Draw(session, Box.Props.{.key = cast(u64)(501 + cast(s32)index * 2), .bounds = pane,
+            .fill = ColorFromPacked(palette_background), .border = ColorFromPacked(palette_border),
             .radius = theme.metrics.radius_mark})
         Label(session, 502 + cast(s32)index * 2, texts[index], .{pane.x + 6.0, pane.y + 2.0, pane.width - 12.0,
             pane.height - 4.0}, font)
@@ -1389,6 +1463,7 @@ TaskTabs :: (session: Session, bounds: Rectangle) {
 #program_export
 Frame :: (session: Session, viewport: Rectangle) -> s32 {
     if !started {
+        #if !#defined(TASKMGR_TAIJI) {
         unused ThemeXInitThreads()
         palette := SystemThemeHostLinux.SystemPaletteRead()
         // Some GTK/host themes report the window background correctly but
@@ -1402,11 +1477,26 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
         palette_text = palette.text
         palette_border = palette.border
         unused SystemTheme.SystemPaletteInstall(palette)
+        }
+        #if #defined(TASKMGR_TAIJI) {
+            theme := Theme.CurrentTheme()
+            palette_background = theme.colors.background
+            palette_text = theme.colors.foreground
+            palette_border = theme.colors.border
+            palette_base = palette_background
+            process_columns[4] = "Est. Memory"
+            group_processes = false
+        }
         current_tab = StartingTab()
         started = true
     }
     frames_since_refresh += 1
-    now_ms := Timer.MonotonicMilliseconds()
+    now_ms: s64 = -1
+    #if !#defined(TASKMGR_TAIJI) {
+        now_ms = Timer.MonotonicMilliseconds()
+    } else {
+        now_ms = GuestClock.Milliseconds()
+    }
     refreshed := last_refresh_ms < 0
     if refresh_interval_ms > 0 {
         if now_ms >= 0 && last_refresh_ms >= 0 &&
@@ -1448,7 +1538,7 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
     small := FontSize(*page, 13)
     theme := Theme.CurrentTheme()
 
-    Box(session, BoxProps.{.key = 1, .bounds = viewport, .fill = Color32(palette_background)})
+    Box.Draw(session, Box.Props.{.key = 1, .bounds = viewport, .fill = ColorFromPacked(palette_background)})
 
     tabs_y := viewport.y + MENU_HEIGHT + 6.0
     TaskTabs(session, .{viewport.x + 8.0, tabs_y, viewport.width - 16.0, TAB_HEIGHT})
@@ -1457,8 +1547,8 @@ Frame :: (session: Session, viewport: Rectangle) -> s32 {
     panel_y := tabs_y + TAB_HEIGHT
     panel := Rectangle.{viewport.x + 8.0, panel_y, viewport.width - 16.0, status_y - panel_y - 6.0}
     if panel.height < 80.0 { panel.height = 80.0 }
-    Box(session, BoxProps.{.key = 41, .bounds = panel, .fill = Color32(PaletteLayer(3)),
-        .border = Color32(palette_border), .radius = theme.metrics.radius_small})
+    Box.Draw(session, Box.Props.{.key = 41, .bounds = panel, .fill = ColorFromPacked(PaletteLayer(3)),
+        .border = ColorFromPacked(palette_border), .radius = theme.metrics.radius_small})
     content := Inset(panel, PAD)
     ColumnWidths(content.width)
     if current_tab == TAB_APPLICATIONS {
