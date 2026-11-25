@@ -42,7 +42,7 @@ with TemporaryDirectory(dir=root / 'build/zx-smoke', prefix='taskmgr-perf-') as 
     image = Path(scratch) / 'profile.zx'
     shutil.copyfile(args.image, image)
     guest = launch(env, (args.emu or root / 'Linux/386/bin/emu').resolve(), '-p', 'main=32M', '-r', root,
-                   '-g', '800x600', 'wm/wm', '/dis/sh.dis', '-c',
+                   '-g', '800x600', 'wm/wm', '/zx/sh.dis', '-c',
                    f'zxrun -w /{image.relative_to(root)}', stdin=subprocess.DEVNULL,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output = bytearray()

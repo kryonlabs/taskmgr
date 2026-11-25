@@ -22,7 +22,7 @@ with TemporaryDirectory(dir=root / 'build/zx-smoke', prefix='taskmgr-cpu-') as d
     image = Path(directory) / 'probe.zx'
     shutil.copyfile(Path(__file__).resolve().parents[1] / 'build/taiji-cpu-live.zx', image)
     command = f"bind '#p' /prog; sleep 10 &; sleep 1; zxrun /{image.relative_to(root)}"
-    result = subprocess.run([emu, '-p', 'main=32M', '-r', root, '/dis/sh.dis', '-c', command],
+    result = subprocess.run([emu, '-p', 'main=32M', '-r', root, '/zx/sh.dis', '-c', command],
                             env=env, start_new_session=True, capture_output=True, timeout=30)
     assert len(result.stdout) <= 128 * 1024, 'guest probe output exceeded bound'
     assert result.returncode in (0, -9), (result.returncode, result.stderr[:4096])
