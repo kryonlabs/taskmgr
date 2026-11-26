@@ -30,9 +30,9 @@ make performance-test  # build the performance harness
 
 ## Pins
 
-- Ziran toolchain: `5462fe2ebf2c3c42663249e47ef99d61f45ff39f`
-- Kryon: `b764139c3c03b3ee183e2e712f9f045b4575fc92`
-- data_views: `e8abb23a4bbae6d92b62d477f816d0fa5ded5e1a`
+- Ziran toolchain: `ecf134facb35654b4d437696984753574525b8dc`
+- Kryon: `35a52f70f3ce4c15cc6eb6feb39d195c3cedf7f7`
+- data_views: `020a427c56e5629b924238745c78363f83acf906`
 
 Commit as Waozi <waozi@proton.me>; ordinary changes stay in CHANGELOG's
 `Unreleased` section. Window tests scrub inherited display/session variables

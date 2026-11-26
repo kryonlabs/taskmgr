@@ -3,15 +3,32 @@
 // X11 framebuffers merely to show a deliberately compact system utility.
 Desktop :: #import "kryon/desktop_loop";
 #import "kryon/tree_frame"
+#import "std/c_string"
 
 App :: #import "app";
 Gpu :: #import "gpu_processes";
+
+host_libc :: #system_library "libc";
+HostSetEnv :: (name: *u8, value: *u8, overwrite: s32) -> s32 #foreign host_libc "setenv";
+
+// Default to Kryon's software pixel presenter unless the caller explicitly
+// opted in (for example, KRYON_PIXMAP_GPU=1). Probing an accelerated SDL
+// renderer pulls Mesa's LLVM/Gallium stack into RSS even when Xvfb or headless
+// environments later fall back to software.
+DefaultSoftwarePresenter :: () {
+    key: [32]u8
+    value: [2]u8
+    if CopyCString("KRYON_PIXMAP_GPU", key[:]) && CopyCString("0", value[:]) {
+        unused HostSetEnv(*key[0], *value[0], 0)
+    }
+}
 
 // `taskmgr --gpu-helper` is the display-free NVML sampler the Applications
 // tab starts from this same binary (see gpu_processes.zi).
 #program_export
 main :: (argc: s32, argv: **u8) -> s32 {
     if Gpu.HelperRequested(argc, argv) { return Gpu.HelperMain() }
+    DefaultSoftwarePresenter()
     Gpu.GpuSharesEnable()
     unused TreeFrameUse()
     return Desktop.Run(App.Frame, 400, 480)

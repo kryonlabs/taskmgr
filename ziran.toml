@@ -7,15 +7,15 @@ tool = "kryon"
 
 [toolchain]
 git = "https://git.waozi.xyz/ziranlang/ziran.git"
-ref = "5462fe2ebf2c3c42663249e47ef99d61f45ff39f"
+ref = "ecf134facb35654b4d437696984753574525b8dc"
 
 [dependencies.kryon]
 git = "https://git.waozi.xyz/kryonlabs/kryon.git"
-ref = "b764139c3c03b3ee183e2e712f9f045b4575fc92"
+ref = "35a52f70f3ce4c15cc6eb6feb39d195c3cedf7f7"
 
 [dependencies.data_views]
 git = "https://git.waozi.xyz/kryonlabs/data-views.git"
-ref = "e8abb23a4bbae6d92b62d477f816d0fa5ded5e1a"
+ref = "020a427c56e5629b924238745c78363f83acf906"
 
 [exports]
 model = "src/model.zi"
