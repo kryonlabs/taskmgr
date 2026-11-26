@@ -213,7 +213,7 @@ current_tab: s32 = TAB_PROCESSES;
 started: bool;
 menu_state: Menu.MenuState;
 
-sort_column: s32 = Model.COLUMN_CPU;
+sort_column: s32 = Model.COLUMN_MEMORY;
 sort_direction: s32 = -1;
 selected_row: s32 = -1;
 selected_pid: s32 = -1;

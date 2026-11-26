@@ -7,7 +7,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 test_binary=$root/build/windows-test
-app_binary=$root/build/taskmgr-desktop
+app_binary=${TASKMGR_BINARY:-$root/build/taskmgr-desktop}
 window_manager=${X11_TEST_WM:-xfwm4}
 display_attempt_limit=${X11_TEST_DISPLAY_ATTEMPTS:-100}
 

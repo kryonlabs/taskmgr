@@ -51,7 +51,7 @@ FieldState :: struct {
 
 session: Session;
 current_tab: s32 = TAB_PROCESSES;
-sort_col: s32 = COL_CPU;
+sort_col: s32 = COL_MEMORY;
 sort_desc: bool = true;
 grouped: bool = true;
 refresh_interval: float64 = 1.0;

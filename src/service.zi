@@ -103,7 +103,7 @@ ReplyLine :: (context: *Context, prefix: string, message: string) -> string {
 
     SnapshotReply :: (context: *Context, request: string) -> string {
         sort_column := Number(request, "sort")
-        if sort_column < 0 || sort_column >= COLUMNS { sort_column = COLUMN_CPU }
+        if sort_column < 0 || sort_column >= COLUMNS { sort_column = COLUMN_MEMORY }
         desc := Number(request, "desc") != 0
         grouped := Number(request, "grouped") != 0
         refresh := Number(request, "refresh") != 0

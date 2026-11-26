@@ -4,7 +4,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-app_binary=$root/build/taskmgr-desktop
+app_binary=${TASKMGR_BINARY:-$root/build/taskmgr-desktop}
 limit_kb=${TASKMGR_RSS_LIMIT_KB:-30720}
 duration_seconds=${TASKMGR_MEMORY_SECONDS:-30}
 display_attempt_limit=${TASKMGR_DISPLAY_ATTEMPTS:-100}

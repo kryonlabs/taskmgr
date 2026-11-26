@@ -25,7 +25,8 @@ three-pane status bar.
   memory never enters the window process. The GPU column appears only once a
   source has data. Shares below 10% show one decimal.
 - **Processes** is a sortable DataViews table with image name, PID, CPU, CPU
-  time and resident memory. Rows are grouped by image name by default, with all
+  time and resident memory, sorted by highest memory use first on startup.
+  Rows are grouped by image name by default, with all
   Codex-family processes combined under `codex`; Options → Group Processes
   toggles the grouping. Clicking an aggregate row expands or collapses its real
   process rows. Selecting any cell highlights the complete row. `End Process`
@@ -72,15 +73,15 @@ make package    # dist/taskmgr-linux-amd64.deb and dist/taskmgr-linux-x86_64.App
 `make package` stages the app with `ziran install`, moves libraries the build
 produced (such as `libkryonavif.so`) to `/usr/lib/taskmgr` and points the
 program's RUNPATH there. It needs `patchelf`, `dpkg-deb`, `dpkg-shlibdeps` and,
-for the AppImage, `LINUXDEPLOY` set to a linuxdeploy AppImage. The release
-workflow publishes both files under these version-free names, so
-`https://github.com/kryonlabs/taskmgr/releases/latest/download/taskmgr-linux-amd64.deb`
-and `.../taskmgr-linux-x86_64.AppImage` always fetch the newest release.
+for the AppImage, `LINUXDEPLOY` set to a linuxdeploy AppImage. Published packages use these version-free names on the
+[Task Manager releases page](https://git.waozi.xyz/kryonlabs/taskmgr/releases).
 
 `make x11-test` never touches the current desktop. It needs `Xvfb`, `xfwm4`
 (or `X11_TEST_WM`), `xterm` and `xprop`; when one is absent it reports a skip.
 `make memory-test` likewise uses only a scrubbed private Xvfb display, waits for
 several process and retained-text refreshes, then enforces a 30 MiB RSS cap.
+Set `TASKMGR_BINARY` to an installed executable to verify that installation
+with either test script.
 
 The desktop profile opens an SDL2 window through Kryon's `desktop` backend.
 The `tui`, `web`, `portable`, and headless `shot` profiles use the same

@@ -27,6 +27,15 @@
 - The Applications GPU column appears only when a per-process GPU source has
   data, instead of a column of `n/a`.
 - The GPU helper process is named `taskmgr-gpu` instead of `exe`.
+- Processes starts sorted by resident memory, with the largest groups first.
+
+### Fixed
+
+- Default the native desktop host to Kryon's software pixel presenter
+  (`KRYON_PIXMAP_GPU=0` unless overridden) so startup does not pull Mesa's
+  LLVM/Gallium stack into RSS.
+- Build the native interface with the current Kryon widget and desktop APIs.
+- Keep history test buffers independent under the current compiler's borrow checks.
 
 ## [0.1.3] - 2026-11-13
 
